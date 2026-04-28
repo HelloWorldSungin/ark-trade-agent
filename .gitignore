@@ -1,0 +1,4 @@
+vault
+
+# OMC private state (per-user, not project-level config)
+.omc/
