@@ -3,3 +3,12 @@ vault
 # OMC private state (per-user, not project-level config)
 .omc/
 .ark-workflow/
+
+# Secrets — never commit. Real deployment values live on LOQ at ~/.config/ark-trade-agent/.
+.env
+.env.*
+!.env.example
+
+# Python build artifacts
+__pycache__/
+*.pyc
