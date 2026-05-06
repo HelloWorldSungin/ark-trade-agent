@@ -77,6 +77,26 @@ LOQ install, Week 2 step 11. Spec § Build Order step 11 amended (Telegram → D
 
 **Token rotation:** if leaked, regenerate at https://discord.com/developers/applications → Ark Trade Agent app → Bot → Reset Token. Update `.env` (Mac) and `/home/ark-dev/.config/ark-trade-agent/discord.env` (LOQ, mode 600), then `systemctl --user restart openclaw-gateway.service` so any OpenClaw subprocess picks it up.
 
+## Heartbeat Configuration
+
+LOQ install, Week 2 step 12. End-to-end smoke green 2026-05-06T00:59:07Z (US.SPY snapshot → Discord post → gbrain tick archive in one cycle). Per spec § Build Order step 12 + § Solo Operator Ergonomics: OpenClaw heartbeat agent reads gbrain watchlist, snapshots each ticker via moomooapi, posts a formatted summary to Discord, archives the tick to gbrain.
+
+| Field | Value |
+|---|---|
+| Workspace contract | `~/.openclaw/workspace/HEARTBEAT.md` (LOQ) — 6-step recipe (read watchlist → snapshot → format → POST → archive → reply) |
+| Watchlist source | gbrain page `arktrade/watchlist` (slug; tag `project-arktrade`); current tickers: `US.SPY` |
+| Snapshot script | `cd /opt/ark-trade-agent && /home/ark-dev/.local/bin/uv run python .claude/skills/moomooapi/scripts/quote/get_snapshot.py --json <CODE> 2>/dev/null` (stderr suppression mandatory — moomoo SDK prints connection log lines that pollute the agent's tool output) |
+| Discord post | `/opt/ark-trade-agent/scripts/notify_discord.py "<formatted-message>"`; env loaded via systemd `EnvironmentFile=` drop-in (covers OpenClaw-spawned subprocesses) |
+| Archive sink | gbrain `arktrade/heartbeats/<...>` page per tick, mandatory frontmatter `tags: [project-arktrade]` |
+| Cadence (target) | 30min default per spec § Build Order step 12 |
+| Cadence (v0 actual) | **manual fire on demand** — `openclaw agent --agent main --message "Read /home/ark-dev/.openclaw/workspace/HEARTBEAT.md and execute every step in order. End with the heartbeat ok/fail line per the file." --thinking medium --timeout 600 --json`. Runtime ~260s wall, 21 tool calls. |
+| Persistent cron | **PARKED.** `openclaw cron add` requires gateway scope upgrade (operator.admin + pairing + read) beyond local CLI's existing `operator.write`. `openclaw devices approve <requestId>` rejects with "unknown requestId" (id rotates per call). Investigate proper scope-upgrade flow during /cso pass (chain step 14). |
+| Model used (actual) | `chutes/zai-org/GLM-4.7-TEE` — pi-agent's chutes provider default. Spec calls for `Kimi-K2.6-TEE`; both are 256K-context. To pin: pass `--model moonshotai/Kimi-K2.6-TEE` on `openclaw agent` (or in `cron add --model …` when cron is unblocked). |
+
+**Path discipline:** all paths in HEARTBEAT.md must be absolute (`/home/ark-dev/.bun/bin/gbrain`, `/home/ark-dev/.local/bin/uv`, `/opt/ark-trade-agent/scripts/notify_discord.py`). The systemd-launched agent has no `~/.bun/bin` or `~/.local/bin` in its PATH.
+
+**Slug-shape debt:** gbrain's slug normalizer drops path prefixes + ISO punctuation, so the agent's `arktrade/heartbeats/us-spy-20260506T005708Z` landed as bare `heartbeat-us-spy-20260506`. Pages remain tagged + searchable so the `project-arktrade` namespace still holds for federation; the on-disk hierarchy is what's lost. Tighten when HEARTBEAT.md gets revised: pre-compute the exact slug in the prompt instead of describing how to construct one. Captured in /wiki-ingest backlog.
+
 ## Patched vendor scripts
 
 These vendor-installed skill scripts have been lifted from sister project moomoo-stock with local modifications — re-apply if a skill is reinstalled (the install copies from `opend-skills.zip` and will overwrite):
