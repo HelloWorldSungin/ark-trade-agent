@@ -169,7 +169,14 @@ LOQ install, Week 3 step 17. Per spec § Build Order step 17 + § Hermes Evaluat
 - Shadow decisions reuse the same `decisions` shape via `decision_kind='shadow'` + `parent_decision_id`. Hermes-Shadow Delta = sum of metric_score differences across (baseline, shadow) pairs over a window.
 - Fills attach only to baseline decisions (shadow is never executed). The schema enforces this at app layer (don't INSERT into fills for shadow decision_ids), not at SQL layer.
 
-**Container access pattern (W3.18 design point — pending):** `/opt/ark-data/eval-ledger.sqlite` is OUTSIDE the existing TradingAgents bind-mount (`/opt/ark-data/tradingagents-state` → container `/home/appuser/.tradingagents`). Three options for W3.18: (a) move ledger inside the existing mount → co-mingles with checkpoints; (b) add a second bind-mount `/opt/ark-data:/home/appuser/eval-data` → clean separation; (c) host-side wrapper script captures TradingAgents output and writes to ledger → keeps container vendor-pure. Decision deferred to W3.18 wiring.
+**Container access pattern (resolved W3.18):** chose option (c) — host-side orchestrator at `scripts/run_prediction_cycle.py`. TradingAgents container stays vendor-pure (no moomoo SDK, no SQLite dependency added to image). Orchestrator drives container via `docker compose run --rm -T --entrypoint python tradingagents -` with the inner script piped through stdin; captures decision JSON between `__ARK_DECISION_JSON__` sentinels in stdout. Then it writes the decision + 7 deferred metric_score rows to the ledger directly, and shells out to `.claude/skills/moomooapi/scripts/trade/place_order.py` via `uv run python` for the paper-trade firing.
+
+**5-tier rating mapping (orchestrator):**
+- `Buy` / `Overweight` → BUY 1 share US.{TICKER} MARKET SIMULATE via place_order.py skill
+- `Hold` → no order, decision row only
+- `Underweight` / `Sell` → no order in v0 (no existing position to close; short-selling left for follow-up). Decision row still lands so Hermes Week 4+ can score it.
+
+**First smoke (W3.18 closeout):** `python3 scripts/run_prediction_cycle.py NVDA 2026-05-06` ran 2026-05-07T17:13–17:32Z (~19 min wall). All 5 phases fired through Chutes/Kimi-K2.6: Market+Social+News+Fundamentals analysts → Bull/Bear research debate → Research Manager → Trader → Aggressive/Conservative/Neutral risk debate → Portfolio Manager. PM landed on `Underweight` (specific $196 entry, $202–$204 trim zone, $181 stop). `decision_id=baseline-20260507T173214Z-8c32b193` lives in ledger with `market_snapshot_json` 38.6KB, `order_intent_json` 7.4KB, `rationale` 2,990 chars + 7 `metric_scores` rows all `score=NULL` `notes='deferred-outcome-window-pending'`. BUY-branch independently exercised via direct place_order.py call returning `order_id=1133546` (US.NVDA SIMULATE).
 
 **Hermes-gate cross-references:**
 - 7-metric definitions + outcome windows: `vault/Specs/openclaw-hermes-trading-agent-v0-spec.md` § Hermes Evaluation Metrics & Shadow Mode
