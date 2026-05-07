@@ -97,6 +97,38 @@ LOQ install, Week 2 step 12. End-to-end smoke green 2026-05-06T00:59:07Z (US.SPY
 
 **Slug-shape debt:** gbrain's slug normalizer drops path prefixes + ISO punctuation, so the agent's `arktrade/heartbeats/us-spy-20260506T005708Z` landed as bare `heartbeat-us-spy-20260506`. Pages remain tagged + searchable so the `project-arktrade` namespace still holds for federation; the on-disk hierarchy is what's lost. Tighten when HEARTBEAT.md gets revised: pre-compute the exact slug in the prompt instead of describing how to construct one. Captured in /wiki-ingest backlog.
 
+## TradingAgents Configuration
+
+LOQ install, Week 3 steps 13 + 14. Vanilla `TauricResearch/TradingAgents` v0.2.4 (NOT the Alpaca fork — locked by /ccg adversarial review amendment). LLM-ping smoke green 2026-05-07T15:46Z (Kimi K2.6 returned `' OK'` via patched chutes provider; bind-mount round-trips clean with UID alignment 1000=1000).
+
+| Field | Value |
+|---|---|
+| Repo path (LOQ) | `/opt/tradingagents/` (clone of `https://github.com/TauricResearch/TradingAgents.git`) |
+| Pinned ref | tag `v0.2.4` ≡ commit `7c37249f808f9c169ad2198dc384166e7ca7adf9` (2026-04-25) |
+| Image | `tradingagents-tradingagents:latest` — built from `/opt/tradingagents/Dockerfile` (Python 3.12-slim, two-stage); ~790MB |
+| Image rebuild after patches | `cd /opt/tradingagents && docker compose build tradingagents` (~80s: ~62s pip + ~15s export) |
+| Provider routing | `provider="chutes"` → `tradingagents/llm_clients/openai_client.py` `_PROVIDER_CONFIG["chutes"]` → `https://llm.chutes.ai/v1` (chat-completions API, NOT responses API) |
+| Default models | `deep_think_llm="moonshotai/Kimi-K2.6-TEE"`, `quick_think_llm="moonshotai/Kimi-K2.6-TEE"` (256K ctx, 10K max-output cap). If the 10K max-output pinches at Trader/PM final-decision stage, switch to K2.5-TEE (same 256K ctx, 262K max-output) — both ride the same chutes provider, no patch change. |
+| Secrets file (LOQ) | `/opt/tradingagents/.env` (mode 600, owned by ark-dev) — currently holds `CHUTES_API_KEY=...` (sourced from pi-agent's `~/.pi/agent/auth.json` chutes block, same key OpenClaw uses) |
+| Checkpoint storage (host) | `/opt/ark-data/tradingagents-state/` (bind-mounted into container at `/home/appuser/.tradingagents/`). LangGraph checkpoint SQLite lives at `<host-mount>/cache/checkpoints/<TICKER>.db`. Survives container removal; introspectable from host. |
+| UID alignment | container `appuser` uid/gid 1000 == host `ark-dev` uid/gid 1000 — no chmod gymnastics needed |
+| Invocation pattern | `cd /opt/tradingagents && docker compose run --rm tradingagents` for the interactive CLI; programmatic / heartbeat-driven invocation will use `--entrypoint python` with a Python entry script (Week 3 step 18 introduces this) |
+| Checkpoint enablement | `--checkpoint` runtime flag OR `default_config["checkpoint_enabled"] = True` in the programmatic entry script (deferred to W3.18; default config still ships `False` and patching `default_config.py` would be another patch surface) |
+
+**TradingAgents patches (re-apply after `git pull` of `/opt/tradingagents/`):**
+
+| File | Reason | Patch sha256 (post-patch) | Applied at |
+|---|---|---|---|
+| `tradingagents/llm_clients/openai_client.py` | Add `"chutes": ("https://llm.chutes.ai/v1", "CHUTES_API_KEY"),` to `_PROVIDER_CONFIG` (line 51) — TradingAgents v0.2.4 has no native Chutes provider | `25a5efd4dd324ee316a1bae76e6b1784729ebd9cfabe3f11b83c6cb24e52c88d` | 2026-05-07 |
+| `tradingagents/llm_clients/factory.py` | Append `"chutes"` to `_OPENAI_COMPATIBLE` tuple (line 7) — routes `provider="chutes"` through `OpenAIClient` (chat-completions, not responses-API) | `1a77b4a7cf76960fca25eca583bccc367d661b0b6a59784e8e27936af4414020` | 2026-05-07 |
+| `docker-compose.yml` | Swap named volume `tradingagents_data:/home/appuser/.tradingagents` → bind-mount `/opt/ark-data/tradingagents-state:/home/appuser/.tradingagents` for both `tradingagents` and `tradingagents-ollama` services. The orphaned `tradingagents_data:` volume definition at the bottom is harmless leftover. | `3023d44c97bd7468fa29b3752333ecfdd1d5960865a4137fe80b45784c92e4ef` | 2026-05-07 |
+
+**Re-apply protocol on TradingAgents bump:** the validators (`tradingagents/llm_clients/validators.py`) auto-accept unknown providers (`if provider_lower not in VALID_MODELS: return True`) so we don't need to touch the model catalog or validators when bumping versions. Just re-apply the three patches via the same sed commands and `docker compose build tradingagents`. Bumping past v0.2.4 should also keep the checkpoint flag wiring intact since it's a tagged-from-v0.2.4 feature.
+
+**Why this shape vs alternatives:** Faking Chutes as `provider="openai"` triggers TradingAgents' `use_responses_api=True` branch, which Chutes doesn't implement (Chutes is chat-completions-only, like xAI/DeepSeek/OpenRouter). The patch keeps Chutes in the same code path as the other OpenAI-compatible providers — minimal patch surface, no API mismatch.
+
+**Pending hardening (/cso pass — chain step 14):** Chutes API key is plaintext in `/opt/tradingagents/.env` mode 0600 (mirrors OpenClaw's `~/.openclaw/openclaw.json` plaintext-chutes-key debt — same SecretRef migration target). Also: tighten the docker-compose service further (network_mode=none for fully-offline runs once analyst tools accept paths instead of URLs; user namespace remap; resource limits).
+
 ## Patched vendor scripts
 
 These vendor-installed skill scripts have been lifted from sister project moomoo-stock with local modifications — re-apply if a skill is reinstalled (the install copies from `opend-skills.zip` and will overwrite):
