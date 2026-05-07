@@ -147,6 +147,35 @@ W3.15 — moomoo content vendors as analyst tools (4 new files + 3 modifications
 
 **Pending hardening (/cso pass — chain step 14):** Chutes API key is plaintext in `/opt/tradingagents/.env` mode 0600 (mirrors OpenClaw's `~/.openclaw/openclaw.json` plaintext-chutes-key debt — same SecretRef migration target). Also: tighten the docker-compose service further (network_mode=none for fully-offline runs once analyst tools accept paths instead of URLs; user namespace remap; resource limits).
 
+## Eval Ledger Configuration
+
+LOQ install, Week 3 step 17. Per spec § Build Order step 17 + § Hermes Evaluation Metrics & Shadow Mode: SQLite eval ledger is the canonical source of truth — TradingAgents writes baseline decisions, Hermes (Week 4+) writes shadow proposals, paper-trade fills attach to baselines, the 7 decision-quality metrics fill in as outcome windows close. Hermes reads from this ledger only, never scrapes logs.
+
+| Field | Value |
+|---|---|
+| Path (LOQ host) | `/opt/ark-data/eval-ledger.sqlite` (owned ark-dev:ark-dev) |
+| Init script | `scripts/init_eval_ledger.py` (project repo) — idempotent, stdlib `sqlite3` only, runs `CREATE TABLE IF NOT EXISTS`. Override path via `--path` or `ARK_EVAL_LEDGER_PATH` env var. |
+| Schema version | `0.1.0` (recorded in `schema_meta` table; bump on incompatible DDL changes) |
+| Tables | `decisions`, `fills`, `metric_scores`, `schema_meta` |
+| Indexes | `idx_decisions_ticker_kind_date`, `idx_decisions_parent`, `idx_fills_decision`, `idx_metric_scores_decision`, `idx_metric_scores_name` |
+| Foreign keys | `decisions.parent_decision_id → decisions.decision_id` (shadow→baseline link); `fills.decision_id → decisions.decision_id`; `metric_scores.decision_id → decisions.decision_id` |
+| Metrics constraint | `metric_scores.metric_name` CHECK enforces exactly 7 metrics from spec § Hermes Evaluation: `thesis_accuracy`, `next_day_direction`, `volatility_adjusted_move`, `max_adverse_excursion`, `catalyst_correctness`, `risk_rule_compliance`, `rationale_trade_match` |
+| Decision-kind constraint | `decisions.decision_kind` CHECK enforces `'baseline'` (TradingAgents-emitted, executed in moomoo paper) or `'shadow'` (Hermes-emitted, never executed) — both ride the same row shape; shadow rows reference their baseline via `parent_decision_id`. |
+| Re-init / reset | Re-run `python3 /opt/ark-trade-agent/scripts/init_eval_ledger.py` to ensure schema present (no-op if existing). To wipe and start fresh: `rm /opt/ark-data/eval-ledger.sqlite && python3 .../init_eval_ledger.py`. |
+
+**Schema rationale (normalized 3 tables, not 1 wide):**
+
+- One row per `metric_score` (per decision × metric) lets each metric land independently as its outcome window closes — instead of forcing the whole decision row to wait for the slowest metric (e.g. catalyst correctness, which may need T+5 data).
+- Shadow decisions reuse the same `decisions` shape via `decision_kind='shadow'` + `parent_decision_id`. Hermes-Shadow Delta = sum of metric_score differences across (baseline, shadow) pairs over a window.
+- Fills attach only to baseline decisions (shadow is never executed). The schema enforces this at app layer (don't INSERT into fills for shadow decision_ids), not at SQL layer.
+
+**Container access pattern (W3.18 design point — pending):** `/opt/ark-data/eval-ledger.sqlite` is OUTSIDE the existing TradingAgents bind-mount (`/opt/ark-data/tradingagents-state` → container `/home/appuser/.tradingagents`). Three options for W3.18: (a) move ledger inside the existing mount → co-mingles with checkpoints; (b) add a second bind-mount `/opt/ark-data:/home/appuser/eval-data` → clean separation; (c) host-side wrapper script captures TradingAgents output and writes to ledger → keeps container vendor-pure. Decision deferred to W3.18 wiring.
+
+**Hermes-gate cross-references:**
+- 7-metric definitions + outcome windows: `vault/Specs/openclaw-hermes-trading-agent-v0-spec.md` § Hermes Evaluation Metrics & Shadow Mode
+- Blessed-baseline prompt SHAs: `vault/Specs/blessed-baseline-tradingagents-prompts-v0.2.4.md` (Hermes proposals diff against this static set)
+- Sample-size gate: ≥30–50 completed decision/outcome pairs before any prompt-quality claim. v0 auto-apply: NEVER (Shadow Mode only).
+
 ## Patched vendor scripts
 
 These vendor-installed skill scripts have been lifted from sister project moomoo-stock with local modifications — re-apply if a skill is reinstalled (the install copies from `opend-skills.zip` and will overwrite):
