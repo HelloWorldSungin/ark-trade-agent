@@ -117,13 +117,31 @@ LOQ install, Week 3 steps 13 + 14. Vanilla `TauricResearch/TradingAgents` v0.2.4
 
 **TradingAgents patches (re-apply after `git pull` of `/opt/tradingagents/`):**
 
+W3.14 — Chutes LLM provider routing (3 patches):
+
 | File | Reason | Patch sha256 (post-patch) | Applied at |
 |---|---|---|---|
 | `tradingagents/llm_clients/openai_client.py` | Add `"chutes": ("https://llm.chutes.ai/v1", "CHUTES_API_KEY"),` to `_PROVIDER_CONFIG` (line 51) — TradingAgents v0.2.4 has no native Chutes provider | `25a5efd4dd324ee316a1bae76e6b1784729ebd9cfabe3f11b83c6cb24e52c88d` | 2026-05-07 |
 | `tradingagents/llm_clients/factory.py` | Append `"chutes"` to `_OPENAI_COMPATIBLE` tuple (line 7) — routes `provider="chutes"` through `OpenAIClient` (chat-completions, not responses-API) | `1a77b4a7cf76960fca25eca583bccc367d661b0b6a59784e8e27936af4414020` | 2026-05-07 |
-| `docker-compose.yml` | Swap named volume `tradingagents_data:/home/appuser/.tradingagents` → bind-mount `/opt/ark-data/tradingagents-state:/home/appuser/.tradingagents` for both `tradingagents` and `tradingagents-ollama` services. The orphaned `tradingagents_data:` volume definition at the bottom is harmless leftover. | `3023d44c97bd7468fa29b3752333ecfdd1d5960865a4137fe80b45784c92e4ef` | 2026-05-07 |
+| `docker-compose.yml` | Swap named volume `tradingagents_data:/home/appuser/.tradingagents` → bind-mount `/opt/ark-data/tradingagents-state:/home/appuser/.tradingagents` for both `tradingagents` and `tradingagents-ollama` services. Orphaned `tradingagents_data:` volume definition at bottom is harmless leftover. | `3023d44c97bd7468fa29b3752333ecfdd1d5960865a4137fe80b45784c92e4ef` | 2026-05-07 |
 
-**Re-apply protocol on TradingAgents bump:** the validators (`tradingagents/llm_clients/validators.py`) auto-accept unknown providers (`if provider_lower not in VALID_MODELS: return True`) so we don't need to touch the model catalog or validators when bumping versions. Just re-apply the three patches via the same sed commands and `docker compose build tradingagents`. Bumping past v0.2.4 should also keep the checkpoint flag wiring intact since it's a tagged-from-v0.2.4 feature.
+W3.15 — moomoo content vendors as analyst tools (4 new files + 3 modifications):
+
+| File | Reason | Patch sha256 | Applied at |
+|---|---|---|---|
+| `tradingagents/dataflows/moomoo_news.py` (NEW) | Lifted from sister-project `moomoo-news-search` SKILL.md. Calls `GET https://ai-news-search.moomoo.com/news_search` (public, unauthenticated). Implements `get_news(ticker, start_date, end_date)` matching the existing news_data signature; date-filtered, formatted as markdown. | `ffef740410d66f511f5e252169f06760bbf467537ebf78a25822b017a3009350` | 2026-05-07 |
+| `tradingagents/dataflows/moomoo_digest.py` (NEW) | Lifted from sister-project `moomoo-stock-digest` SKILL.md. Same `/news_search` endpoint as moomoo_news but framed for direction-judgment by the calling analyst (bullish/bearish/neutral interpretation directive). Implements `get_stock_digest(ticker)`. | `17acdbb60f30f7bb8c37df64bbbd705d402652491f122b9c5b313ba30c83e81d` | 2026-05-07 |
+| `tradingagents/dataflows/moomoo_sentiment.py` (NEW) | Lifted from sister-project `moomoo-comment-sentiment` SKILL.md. Calls `GET https://ai-news-search.moomoo.com/stock_feed`; strips HTML, returns post list with sentiment-classification directive. Implements `get_community_sentiment(ticker)`. | `bc71c0f1b89e16d530ca70140355351b0c8b1e0829be8a35ddff633899c2dc4e` | 2026-05-07 |
+| `tradingagents/agents/utils/social_data_tools.py` (NEW) | New `@tool def get_community_sentiment(ticker)` for the social_data category — gives the Social Media Analyst a community-sentiment tool routed via dispatcher. | `1467f6f470c0d2ccd20c3eb8b6dbdc75d012eb59225d39dfff5ca2de1c5d174d` | 2026-05-07 |
+| `tradingagents/dataflows/interface.py` (MODIFIED) | Imports moomoo vendors; appends `"moomoo"` to VENDOR_LIST; appends `"get_stock_digest"` to news_data tools; adds new TOOLS_CATEGORIES entry `"social_data"` with `get_community_sentiment`; adds `"moomoo": get_moomoo_news` to existing `get_news` VENDOR_METHODS entry; adds new VENDOR_METHODS entries for `get_stock_digest` and `get_community_sentiment` (moomoo-only vendors). | `f420c0b0f96205332fee0e2610aca0aa2155c9fd51f8ee6e4bfea7309b2fbdd8` | 2026-05-07 |
+| `tradingagents/default_config.py` (MODIFIED) | Adds `"social_data": "moomoo"` default to `data_vendors`; updates `news_data` comment to list moomoo as an option. | `0738c001fa8a08293379f741d8e5c5e5c4fca9714a5b2a58c62dfb3ddf0c76a6` | 2026-05-07 |
+| `tradingagents/agents/utils/news_data_tools.py` (MODIFIED) | Appends `@tool def get_stock_digest(ticker)` so the News Analyst can request a single-stock digest distinct from the raw `get_news` roundup. | `0af3ab7c57ef3409c325d8994c0beb110bb46175908b4aa470ad6821812421d7` | 2026-05-07 |
+
+**Architecture note:** moomoo's public endpoints are unauthenticated — no API key, no signing, no auth state. The skills' "intelligence" (interpretation, sorting, classification) was always LLM-driven and stays in the TradingAgents analyst graph. Vendors only fetch + format raw items; the calling analyst LLM does the analysis. This keeps each vendor at ~50-70 LOC and avoids re-implementing skill workflows in deterministic Python.
+
+**Dispatcher behavior** (verified W3.15 smoke): TradingAgents' `route_to_vendor` walks `VENDOR_METHODS[method]` for the configured vendor. Unregistered (method, vendor) pairs are skipped via `if vendor not in VENDOR_METHODS[method]: continue` — so moomoo_news only registers for `get_news`, not for `get_global_news`/`get_insider_transactions` (moomoo's public endpoint has no global-news or insider-transactions feed). The dispatcher gracefully routes those to yfinance/alpha_vantage instead.
+
+**Re-apply protocol on TradingAgents bump:** the validators (`tradingagents/llm_clients/validators.py`) auto-accept unknown providers, so model-catalog edits aren't needed when bumping versions. The 3 NEW vendor files + `social_data_tools.py` are conflict-free on `git pull` (new files don't merge-collide). The 3 MODIFIED files (interface.py, default_config.py, news_data_tools.py) need re-application via the same surgical edits captured above. Total patch surface for W3.14+W3.15: 3 modifications from W3.14 + 4 new files + 3 modifications from W3.15 = 10 files tracked.
 
 **Why this shape vs alternatives:** Faking Chutes as `provider="openai"` triggers TradingAgents' `use_responses_api=True` branch, which Chutes doesn't implement (Chutes is chat-completions-only, like xAI/DeepSeek/OpenRouter). The patch keeps Chutes in the same code path as the other OpenAI-compatible providers — minimal patch surface, no API mismatch.
 
