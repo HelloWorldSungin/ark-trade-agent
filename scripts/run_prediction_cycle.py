@@ -25,13 +25,15 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sqlite3
 import sys
 import textwrap
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
+
+from ledger_constants import CANONICAL_SIGNALS, METRICS
 
 # ---------- Defaults (LOQ-shaped) ----------
 DEFAULT_LEDGER_PATH = os.environ.get("ARK_EVAL_LEDGER_PATH", "/opt/ark-data/eval-ledger.sqlite")
@@ -40,18 +42,41 @@ DEFAULT_PROJECT_DIR = os.environ.get("ARK_PROJECT_DIR", "/opt/ark-trade-agent")
 DEFAULT_PROMPT_VERSION = "v0.2.4-blessed-2026-05-07"  # matches blessed-baseline vault page
 DEFAULT_MODEL = "moonshotai/Kimi-K2.6-TEE"
 DEFAULT_CONTAINER_TIMEOUT_SEC = 1500
+# Absolute path mandatory — `ssh user@host 'cmd'` and systemd ExecStart both skip
+# ~/.bashrc, so `~/.local/bin` won't be on PATH. Mirrors score_metrics.py:53.
+DEFAULT_UV_BIN = os.environ.get("ARK_UV_BIN", "/home/ark-dev/.local/bin/uv")
 SENTINEL_BEGIN = "__ARK_DECISION_JSON__"
 SENTINEL_END = "__ARK_DECISION_JSON_END__"
 
-METRICS = (
-    "thesis_accuracy",
-    "next_day_direction",
-    "volatility_adjusted_move",
-    "max_adverse_excursion",
-    "catalyst_correctness",
-    "risk_rule_compliance",
-    "rationale_trade_match",
-)
+# METRICS + CANONICAL_SIGNALS imported from ledger_constants at top of file.
+
+# ---------- Argument validators ----------
+# build_inner_script() interpolates `ticker` and `trade_date` via f-string repr()
+# into Python source that runs inside the TradingAgents container. repr() is partial
+# protection against argv injection — these regex validators are the real guard.
+# Match common US-listing shapes (NVDA, BRK.B, BF.B). Reject anything else loudly
+# at argparse time so a cron/OpenClaw caller can't reach build_inner_script with
+# unvalidated input.
+TICKER_RE = re.compile(r"^[A-Z]{1,5}(\.[A-Z]{1,2})?$")
+TRADE_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _validate_ticker(s: str) -> str:
+    if not TICKER_RE.match(s):
+        raise argparse.ArgumentTypeError(
+            f"ticker {s!r} must match [A-Z]{{1,5}}(\\.[A-Z]{{1,2}})? (e.g. NVDA, BRK.B)"
+        )
+    return s
+
+
+def _validate_trade_date(s: str) -> str:
+    if not TRADE_DATE_RE.match(s):
+        raise argparse.ArgumentTypeError(f"trade_date {s!r} must be YYYY-MM-DD")
+    try:
+        datetime.strptime(s, "%Y-%m-%d")
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"trade_date {s!r}: {e}") from e
+    return s
 
 
 # ---------- Inner Python snippet (runs inside TradingAgents container) ----------
@@ -182,19 +207,35 @@ def update_decision_broker_order(conn: sqlite3.Connection, decision_id: str, bro
 
 
 # ---------- moomoo paper trade ----------
+def normalize_signal(signal: str) -> str | None:
+    """Return canonical 5-tier signal in lowercase, or None if unrecognized.
+
+    Tolerant of Kimi-emitted variants ("Strong Buy", "BUY!", "Buy (high conviction)",
+    "Overweight (with caveats)") via word-boundary search against the 5 canonical
+    tokens. Mirrors score_metrics.extract_signal's normalization rule.
+    """
+    s = (signal or "").strip().strip("!.,;:()[]{}").lower()
+    for c in CANONICAL_SIGNALS:
+        if re.search(rf"\b{c}\b", s):
+            return c
+    return None
+
+
 def signal_to_side(signal: str) -> str | None:
-    s = (signal or "").strip().lower()
-    if s in ("buy", "overweight"):
+    """Map 5-tier signal to BUY or None. Returns None for Hold, Underweight, Sell,
+    OR unrecognized text. Use normalize_signal() separately to distinguish the
+    unrecognized-text case — main() needs that distinction for exit-code routing."""
+    canon = normalize_signal(signal)
+    if canon in ("buy", "overweight"):
         return "BUY"
-    if s in ("hold",):
-        return None
-    return None  # underweight / sell skipped for v0 smoke (no existing position)
+    return None  # hold / underweight / sell / unrecognized — v0 short-side skipped
 
 
-def place_paper_order(project_dir: str, ticker: str, side: str, qty: int = 1) -> dict:
+def place_paper_order(project_dir: str, ticker: str, side: str, qty: int = 1,
+                      uv_bin: str = DEFAULT_UV_BIN) -> dict:
     code = f"US.{ticker}" if not ticker.startswith(("US.", "HK.", "CN.")) else ticker
     cmd = [
-        "uv", "run", "python",
+        uv_bin, "run", "python",
         f"{project_dir}/.claude/skills/moomooapi/scripts/trade/place_order.py",
         "--code", code,
         "--side", side,
@@ -209,17 +250,50 @@ def place_paper_order(project_dir: str, ticker: str, side: str, qty: int = 1) ->
         sys.stderr.write(f"[orchestrator] place_order exited {proc.returncode}\n")
         sys.stderr.write(f"[orchestrator] stderr:\n{proc.stderr}\n")
         return {"success": False, "stderr": proc.stderr, "stdout": proc.stdout}
+    # moomoo SDK pollutes stdout with OpenQuoteContext connect/disconnect log lines
+    # (the same noise pattern score_metrics.py:177 already learned to handle). Scan
+    # for the first line starting with `{` rather than naively taking the last line.
+    # Contract: rc=0 ⇒ stdout MUST contain a parseable JSON object. Violation = hard
+    # failure (return success=False with a parse_error breadcrumb) so the decision row
+    # is NOT committed with a NULL broker_order_id — that previous silent path
+    # untethered live paper trades from the eval ledger.
+    json_line = next(
+        (ln for ln in proc.stdout.splitlines() if ln.lstrip().startswith("{")),
+        None,
+    )
+    if json_line is None:
+        sys.stderr.write(
+            "[orchestrator] place_order rc=0 but stdout has no JSON line; "
+            "treating as failure to avoid orphaning the decision row\n"
+            f"[orchestrator] stdout:\n{proc.stdout}\n"
+        )
+        return {
+            "success": False,
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+            "parse_error": "no-json-line-in-stdout",
+        }
     try:
-        return {"success": True, "raw": proc.stdout, "parsed": json.loads(proc.stdout.strip().split("\n")[-1])}
-    except json.JSONDecodeError:
-        return {"success": True, "raw": proc.stdout, "parsed": None}
+        parsed = json.loads(json_line)
+    except json.JSONDecodeError as e:
+        sys.stderr.write(
+            f"[orchestrator] place_order rc=0 but JSON line failed to decode: {e}\n"
+            f"[orchestrator] stdout:\n{proc.stdout}\n"
+        )
+        return {
+            "success": False,
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+            "parse_error": f"json-decode-failed: {e}",
+        }
+    return {"success": True, "raw": proc.stdout, "parsed": parsed}
 
 
 # ---------- Main ----------
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
-    parser.add_argument("ticker", help="US ticker, e.g. NVDA")
-    parser.add_argument("trade_date", help="YYYY-MM-DD")
+    parser.add_argument("ticker", type=_validate_ticker, help="US ticker, e.g. NVDA or BRK.B")
+    parser.add_argument("trade_date", type=_validate_trade_date, help="YYYY-MM-DD")
     parser.add_argument("--ledger", default=DEFAULT_LEDGER_PATH)
     parser.add_argument("--tradingagents-dir", default=DEFAULT_TRADINGAGENTS_DIR)
     parser.add_argument("--project-dir", default=DEFAULT_PROJECT_DIR)
@@ -244,37 +318,76 @@ def main() -> int:
 
     conn = sqlite3.connect(args.ledger)
     conn.execute("PRAGMA foreign_keys = ON;")
+    paper_trade_failed = False
     try:
-        insert_decision_row(conn, decision_id, decision, args.prompt_version)
-        insert_deferred_metric_rows(conn, decision_id)
-        conn.commit()
+        # Single explicit transaction: decision row + 7 metric_scores rows commit
+        # together or neither commits. Closes the orphan-decision window where
+        # insert_deferred_metric_rows could partially complete after the decision
+        # row was already inserted (autocommit gap).
+        with conn:
+            insert_decision_row(conn, decision_id, decision, args.prompt_version)
+            insert_deferred_metric_rows(conn, decision_id)
         print(f"[orchestrator] inserted decision_id={decision_id} + 7 deferred metric rows", flush=True)
 
-        side = signal_to_side(decision["signal"])
+        canonical = normalize_signal(decision["signal"])
+        side = "BUY" if canonical in ("buy", "overweight") else None
         if args.dry_run:
-            print(f"[orchestrator] --dry-run: skipping moomoo paper trade", flush=True)
+            print("[orchestrator] --dry-run: skipping moomoo paper trade", flush=True)
+        elif canonical is None:
+            # Unrecognized — distinguish from intentional Hold/Sell.
+            sys.stderr.write(
+                f"[orchestrator] WARNING: signal {decision['signal']!r} did not "
+                f"normalize to any of the 5 canonical tiers (buy/overweight/hold/"
+                f"underweight/sell). No paper trade fired; decision row recorded.\n"
+            )
+            paper_trade_failed = True
         elif side is None:
-            print(f"[orchestrator] signal {decision['signal']!r} → no paper trade fired (Hold or unsupported sell branch)", flush=True)
+            print(f"[orchestrator] signal {decision['signal']!r} → canonical={canonical!r}; "
+                  f"no paper trade fired (Hold or v0-unsupported short side)", flush=True)
         else:
-            print(f"[orchestrator] firing moomoo paper trade: {side} 1 share {decision['ticker']} MARKET SIMULATE ...", flush=True)
+            print(f"[orchestrator] firing moomoo paper trade: {side} 1 share "
+                  f"{decision['ticker']} MARKET SIMULATE ...", flush=True)
             result = place_paper_order(args.project_dir, decision["ticker"], side)
+            broker_order_id = None
             if result["success"]:
-                broker_order_id = None
                 parsed = result.get("parsed")
                 if isinstance(parsed, dict):
-                    broker_order_id = str(parsed.get("order_id") or parsed.get("orderId") or "") or None
-                if broker_order_id:
+                    # Use explicit `is None` check so an order_id of 0 (falsy int)
+                    # doesn't get treated as missing — the broker contract is
+                    # presence/absence, not truthiness.
+                    oid = parsed.get("order_id")
+                    if oid is None:
+                        oid = parsed.get("orderId")
+                    if oid is not None:
+                        broker_order_id = str(oid)
+                if broker_order_id is not None:
                     update_decision_broker_order(conn, decision_id, broker_order_id)
                     conn.commit()
-                    print(f"[orchestrator] order accepted; broker_order_id={broker_order_id}", flush=True)
+                    print(f"[orchestrator] order accepted; broker_order_id={broker_order_id}",
+                          flush=True)
                 else:
-                    print(f"[orchestrator] order accepted but no order_id in parsed JSON; raw stdout:\n{result['raw']}", flush=True)
+                    sys.stderr.write(
+                        f"[orchestrator] WARNING: place_order rc=0 + parseable JSON, but "
+                        f"no order_id field. Decision row remains UNLINKED to a broker order.\n"
+                        f"[orchestrator] raw stdout:\n{result.get('raw', '')}\n"
+                    )
+                    paper_trade_failed = True
             else:
-                print(f"[orchestrator] paper trade FAILED; decision row remains without broker_order_id", flush=True)
+                sys.stderr.write(
+                    "[orchestrator] paper trade FAILED; decision row remains without "
+                    f"broker_order_id. parse_error={result.get('parse_error')!r}\n"
+                )
+                paper_trade_failed = True
     finally:
         conn.close()
 
     print(f"[orchestrator] DONE — decision_id={decision_id}", flush=True)
+    if paper_trade_failed:
+        # Exit 3 signals "decision row landed but the broker-link did not".
+        # Cron callers can detect this and trigger a reconciliation step rather
+        # than treating the run as fully successful.
+        print("[orchestrator] EXIT 3: paper trade unlinked or failed", flush=True)
+        return 3
     return 0
 
 

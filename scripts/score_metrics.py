@@ -44,6 +44,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
+from ledger_constants import METRICS, SIGNAL_DIRECTION
+
 DEFAULT_LEDGER_PATH = "/opt/ark-data/eval-ledger.sqlite"
 DEFAULT_KLINE_SCRIPT = (
     "/opt/ark-trade-agent/.claude/skills/moomooapi/scripts/quote/get_kline.py"
@@ -55,25 +57,9 @@ DEFAULT_FLAT_THRESHOLD = 0.005  # 0.5% — moves within this band count as flat
 KLINE_TIMEOUT_S = 60
 KLINE_WINDOW_DAYS = 10  # calendar days fetched starting at trade_date — buffer for weekends/holidays
 
-ALL_METRICS = (
-    "thesis_accuracy",
-    "next_day_direction",
-    "volatility_adjusted_move",
-    "max_adverse_excursion",
-    "catalyst_correctness",
-    "risk_rule_compliance",
-    "rationale_trade_match",
-)
-
-# 5-tier signal vocabulary from spec § Hermes Evaluation Metrics & Shadow Mode.
-# Mapped to direction sign for `next_day_direction` scoring.
-SIGNAL_DIRECTION = {
-    "buy": +1,
-    "overweight": +1,
-    "hold": 0,
-    "underweight": -1,
-    "sell": -1,
-}
+# ALL_METRICS retained as an alias for argparse choices/CLI surface compat.
+# METRICS + SIGNAL_DIRECTION imported from ledger_constants — single source of truth.
+ALL_METRICS = METRICS
 
 
 # ---------------------------------------------------------------------------
@@ -105,22 +91,42 @@ class ScoreResult:
 
 
 def extract_signal(decision: DecisionRow) -> Optional[str]:
-    """Return the 5-tier signal in lowercase, or None if unrecognized.
+    """Return the 5-tier signal in lowercase canonical form, or None if unrecognized.
 
     Baseline rows: `order_intent_json["signal"]` (per run_prediction_cycle.py).
     Shadow rows: `order_intent_json["shadow_decision"]["shadow_signal"]`
     (per run_hermes_proposal.py).
+
+    Tolerant normalizer: Kimi K2.6 has been observed emitting variants like
+    "Strong Buy", "Buy (high conviction)", "BUY!", "Overweight (with caveats)".
+    We strip trailing punctuation/whitespace, lowercase, then check exact match
+    against SIGNAL_DIRECTION; on miss, fall back to a prefix match against the 5
+    canonical tokens (so "strong buy" → "buy"). Anything that fails both checks
+    returns None — caller decides whether to skip-or-warn.
     """
-    intent = json.loads(decision.order_intent_json) if decision.order_intent_json else {}
-    raw = intent.get("signal")
-    if raw is None:
+    if not decision.order_intent_json:
+        return None
+    try:
+        intent = json.loads(decision.order_intent_json)
+    except json.JSONDecodeError:
+        return None
+    raw = intent.get("signal") if isinstance(intent, dict) else None
+    if raw is None and isinstance(intent, dict):
         shadow_dec = intent.get("shadow_decision")
         if isinstance(shadow_dec, dict):
             raw = shadow_dec.get("shadow_signal")
     if not isinstance(raw, str):
         return None
-    normalized = raw.strip().lower()
-    return normalized if normalized in SIGNAL_DIRECTION else None
+    normalized = raw.strip().strip("!.,;:()[]{}").lower()
+    if normalized in SIGNAL_DIRECTION:
+        return normalized
+    # Tolerant: any leading token that matches a canonical signal wins.
+    # Example: "strong buy" / "buy (high conviction)" both → "buy".
+    for canonical in SIGNAL_DIRECTION:
+        # match either ^canonical$ or ^...\s+canonical\b or ^canonical\b...
+        if re.search(rf"\b{re.escape(canonical)}\b", normalized):
+            return canonical
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +305,21 @@ def score_next_day_direction(
             outcome_window_end_timestamp=None,
             notes=f"window-not-closed; T+1 ({t1_date.isoformat()}) is in the future",
         )
+    # If T+1 is today, the daily candle may still be in-progress (US RTH closes
+    # at ≈21:00 UTC standard / 20:00 UTC daylight saving). Refuse to score until
+    # the close has happened — otherwise a partial intraday candle gets locked
+    # in as the final score.
+    RTH_CLOSE_UTC_HOUR = 21  # conservative — covers EST; EDT will be one hour earlier
+    if t1_date == today.date() and today.hour < RTH_CLOSE_UTC_HOUR:
+        return ScoreResult(
+            score=None,
+            score_label=None,
+            outcome_window_end_timestamp=None,
+            notes=(
+                f"window-not-closed; T+1 is today and current UTC hour "
+                f"{today.hour} < {RTH_CLOSE_UTC_HOUR} (US RTH close)"
+            ),
+        )
 
     if t0["close"] <= 0:
         return ScoreResult(
@@ -346,45 +367,80 @@ def score_next_day_direction(
 # ---------------------------------------------------------------------------
 
 # Three risk-rule ingredients the rationale/order_intent must mention for a
-# directional trade: entry price, exit/target zone, hard stop. Patterns scan
-# for either explicit price levels ("$181") or named structure ("stop loss").
-# Heuristic-v0 — future iterations can replace with LLM judgment or with
-# direct order_intent_json structured fields once run_prediction_cycle.py
-# stops emitting only text blobs.
+# directional trade: entry price, exit/target zone, hard stop. A keyword alone
+# is not enough — the rationale must specify a concrete price level. We
+# enforce that by requiring a `$N` token within PRICE_PROXIMITY_CHARS of the
+# keyword match. Heuristic-v0 — replace with structured-field reads once
+# run_prediction_cycle.py extracts entry/target/stop as JSON fields rather
+# than free-text rationale.
+PRICE_RE = re.compile(r"\$\s*\d")
+PRICE_PROXIMITY_CHARS = 40
 ENTRY_PATTERN = re.compile(
-    r"(entry|enter\s+at|buy\s+near|near\s+\$\s*\d+|limit\s+\$\s*\d+|"
-    r"around\s+\$\s*\d+|initiate|entry\s+price)",
+    r"(?:\bentry\b|\benter\s+at\b|\bbuy\s+near\b|\bnear\s+\$\s*\d+|"
+    r"\blimit\s+\$\s*\d+|\baround\s+\$\s*\d+|\binitiate\b|\bentry\s+price\b)",
     re.IGNORECASE,
 )
 TARGET_PATTERN = re.compile(
-    r"(target|trim|take[\s\-]?profit|exit\s+\$\s*\d+|sell\s+at\s+\$\s*\d+|"
-    r"upside\s+\$\s*\d+|tp\s*[:=]\s*\$?\d+|profit[\s\-]?target)",
+    r"(?:\btarget\b|\btrim\b|\btake[\s\-]?profit\b|\bexit\s+\$\s*\d+|"
+    r"\bsell\s+at\s+\$\s*\d+|\bupside\s+\$\s*\d+|\btp\s*[:=]\s*\$?\d+|"
+    r"\bprofit[\s\-]?target\b)",
     re.IGNORECASE,
 )
 STOP_PATTERN = re.compile(
-    r"(stop[\s\-]?loss|stop\s+\$\s*\d+|sl\s*[:=]\s*\$?\d+|cut\s+at\s+\$\s*\d+|"
-    r"hard\s+stop|risk\s+\$\s*\d+|downside\s+\$\s*\d+|stop\s+at\s+\$\s*\d+)",
+    r"(?:\bstop[\s\-]?loss\b|\bstop\s+\$\s*\d+|\bsl\s*[:=]\s*\$?\d+|"
+    r"\bcut\s+at\s+\$\s*\d+|\bhard\s+stop\b|\brisk\s+\$\s*\d+|"
+    r"\bdownside\s+\$\s*\d+|\bstop\s+at\s+\$\s*\d+)",
     re.IGNORECASE,
 )
+
+
+def _has_anchored_match(pattern: re.Pattern, text: str) -> bool:
+    """True if `pattern` matches AND a `$N` token sits within PRICE_PROXIMITY_CHARS
+    of the match. Closes the bare-keyword false-positive vector: words like
+    "initiate", "profit-target", "hard stop" no longer count without a price."""
+    for m in pattern.finditer(text):
+        start, end = m.span()
+        # If the match itself contains a `$N` (e.g. "near $200"), accept directly.
+        if PRICE_RE.search(text[start:end]):
+            return True
+        left = max(0, start - PRICE_PROXIMITY_CHARS)
+        right = min(len(text), end + PRICE_PROXIMITY_CHARS)
+        if PRICE_RE.search(text[left:right]):
+            return True
+    return False
 
 
 def score_risk_rule_compliance(
     decision: DecisionRow, **_kwargs
 ) -> ScoreResult:
-    """Heuristic T+0 score: count of (entry, target, stop) mentions / 3."""
+    """Heuristic T+0 score: count of (entry, target, stop) mentions / 3.
+
+    Hold signals short-circuit to 1.0 — there is no position to risk-manage,
+    so the three structural risk-rules don't apply. Scoring Hold as 0/3 would
+    incorrectly punish a valid no-trade decision.
+    """
+    signal = extract_signal(decision)
+    window_end_ts = f"{decision.trade_date}T21:00:00+00:00"
+    if signal == "hold":
+        return ScoreResult(
+            score=1.0,
+            score_label="heuristic-v0/hold-no-position-rules-apply",
+            outcome_window_end_timestamp=window_end_ts,
+            notes="Hold decision — no entry/target/stop required (no position to risk-manage)",
+        )
+
     text = (decision.rationale or "") + " " + (decision.order_intent_json or "")
-    has_entry = bool(ENTRY_PATTERN.search(text))
-    has_target = bool(TARGET_PATTERN.search(text))
-    has_stop = bool(STOP_PATTERN.search(text))
+    has_entry = _has_anchored_match(ENTRY_PATTERN, text)
+    has_target = _has_anchored_match(TARGET_PATTERN, text)
+    has_stop = _has_anchored_match(STOP_PATTERN, text)
     count = int(has_entry) + int(has_target) + int(has_stop)
     score = count / 3.0
     label = (
         f"heuristic-v0/{count}-of-3:"
         f"entry={has_entry},target={has_target},stop={has_stop}"
     )
-    window_end_ts = f"{decision.trade_date}T21:00:00+00:00"
     notes = (
-        f"heuristic-v0 regex pass over rationale+order_intent_json "
+        f"heuristic-v0 regex pass with $N-proximity anchor over rationale+order_intent_json "
         f"(text_len={len(text)}); ingredients found: "
         f"entry={has_entry}, target={has_target}, stop={has_stop}"
     )
@@ -417,6 +473,47 @@ BEAR_TOKENS = re.compile(
 )
 SENTIMENT_THRESHOLD = 0.2  # |sentiment| must clear this for a directional match
 
+# Trust-boundary markers from /opt/tradingagents/tradingagents/dataflows/moomoo_news.py
+# (/cso Finding 3 mitigation). The article body wrapped by these markers contains
+# third-party content that the analyst LLM consumed but isn't authored opinion —
+# leaving it in the scored text contaminates the lexicon count with whichever way
+# the article happened to lean.
+_TRUST_BOUNDARY_BLOCK = re.compile(
+    r"---\s*THIRD-PARTY UNTRUSTED CONTENT BEGIN\s*---.*?"
+    r"---\s*THIRD-PARTY UNTRUSTED CONTENT END\s*---",
+    re.DOTALL,
+)
+
+
+def _extract_decision_text(decision: DecisionRow) -> str:
+    """Build the text used for sentiment scoring.
+
+    Reads the structured fields out of `order_intent_json` (not the raw JSON blob
+    whose key names like `"signal": "Underweight"` would contribute false lexicon
+    hits). Baseline rows expose final_trade_decision + investment_plan; shadow
+    rows expose shadow_decision.shadow_rationale. Strips moomoo trust-boundary
+    blocks so a bearish article body inside a Buy rationale doesn't flip the
+    sentiment score.
+    """
+    parts: list[str] = [decision.rationale or ""]
+    if decision.order_intent_json:
+        try:
+            intent = json.loads(decision.order_intent_json)
+        except json.JSONDecodeError:
+            intent = None
+        if isinstance(intent, dict):
+            for k in ("final_trade_decision", "investment_plan", "trader_investment_plan"):
+                v = intent.get(k)
+                if isinstance(v, str):
+                    parts.append(v)
+            shadow_dec = intent.get("shadow_decision")
+            if isinstance(shadow_dec, dict):
+                v = shadow_dec.get("shadow_rationale")
+                if isinstance(v, str):
+                    parts.append(v)
+    joined = " ".join(parts)
+    return _TRUST_BOUNDARY_BLOCK.sub(" [redacted-untrusted-block] ", joined)
+
 
 def score_rationale_trade_match(
     decision: DecisionRow, **_kwargs
@@ -432,7 +529,7 @@ def score_rationale_trade_match(
         )
     predicted_dir = SIGNAL_DIRECTION[signal]
 
-    text = (decision.rationale or "") + " " + (decision.order_intent_json or "")
+    text = _extract_decision_text(decision)
     bull = len(BULL_TOKENS.findall(text))
     bear = len(BEAR_TOKENS.findall(text))
     total = bull + bear
@@ -517,6 +614,10 @@ def fetch_unscored_decisions(
     sql += " ORDER BY d.trade_date ASC, d.decision_id ASC"
 
     with sqlite3.connect(str(ledger_path)) as conn:
+        # PRAGMA foreign_keys is per-connection (not per-database) — every script
+        # opening a connection must re-issue it, otherwise FK constraints silently
+        # fail on this connection even though init_eval_ledger.py enabled them.
+        conn.execute("PRAGMA foreign_keys = ON")
         rows = conn.execute(sql, params).fetchall()
     return [
         DecisionRow(
@@ -548,7 +649,8 @@ def update_metric_score(
          WHERE decision_id = ? AND metric_name = ?
     """
     with sqlite3.connect(str(ledger_path)) as conn:
-        conn.execute(
+        conn.execute("PRAGMA foreign_keys = ON")
+        cur = conn.execute(
             sql,
             (
                 result.score,
@@ -560,6 +662,14 @@ def update_metric_score(
                 metric,
             ),
         )
+        # The UPDATE must have hit exactly one row — otherwise the orchestrator
+        # logs "SCORED" but the ledger stays NULL. Raise loudly so the caller's
+        # failed-counter increments rather than silently diverging from reality.
+        if cur.rowcount != 1:
+            raise RuntimeError(
+                f"update_metric_score rowcount={cur.rowcount} (expected 1) for "
+                f"decision_id={decision_id!r} metric={metric!r}"
+            )
         conn.commit()
 
 

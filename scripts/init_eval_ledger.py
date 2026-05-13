@@ -31,9 +31,15 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = "0.1.0"
+from ledger_constants import SCHEMA_VERSION  # canonical version string
 
 DDL = """
+-- PRAGMA must run before executescript()'s implicit COMMIT becomes load-bearing.
+-- Also: foreign_keys is a per-connection setting (not per-database), so every
+-- script opening a Connection MUST re-issue this PRAGMA. See score_metrics.py,
+-- run_prediction_cycle.py, run_hermes_proposal.py for the connection-opener pattern.
+PRAGMA foreign_keys = ON;
+
 CREATE TABLE IF NOT EXISTS decisions (
     decision_id                       TEXT PRIMARY KEY,
     parent_decision_id                TEXT REFERENCES decisions(decision_id),
@@ -119,9 +125,8 @@ def init_ledger(db_path: Path) -> dict:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     fresh = not db_path.exists()
     conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA foreign_keys = ON;")
     try:
-        conn.executescript(DDL)
+        conn.executescript(DDL)  # DDL's first statement enables PRAGMA foreign_keys
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")
         for key, value in META_ROWS:
             conn.execute(

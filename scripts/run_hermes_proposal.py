@@ -39,6 +39,8 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from ledger_constants import BLESSED_ROLES, METRICS, SCHEMA_VERSION
+
 DEFAULT_LEDGER = os.environ.get("ARK_EVAL_LEDGER_PATH", "/opt/ark-data/eval-ledger.sqlite")
 DEFAULT_PROPOSALS_DIR = os.environ.get(
     "ARK_HERMES_PROPOSALS_DIR", "/opt/ark-data/hermes-proposals"
@@ -55,7 +57,6 @@ DEFAULT_NOTIFY_DISCORD_BIN = os.environ.get(
 LOQ_HOSTNAME_FOR_SCP = os.environ.get("ARK_LOQ_SSH_HOST", "ark-dev@192.168.68.83")
 DISCORD_CONTENT_CAP = 2000  # Discord hard limit; notify_discord.py's caller-respect contract
 
-SCHEMA_VERSION = "v0.1.0"
 HERMES_RELEASE = "v0.12.0 (2026.4.30)"
 HERMES_MODEL = "moonshotai/Kimi-K2.6-TEE"
 SAMPLE_SIZE_GATE = 30
@@ -64,32 +65,9 @@ HERMES_TIMEOUT_S = 240
 SENTINEL_BEGIN = "__HERMES_PROPOSAL_JSON__"
 SENTINEL_END = "__HERMES_PROPOSAL_JSON_END__"
 
-# 7 metrics — must match metric_scores.metric_name CHECK constraint (eval ledger schema v0.1.0)
-METRICS = (
-    "thesis_accuracy",
-    "next_day_direction",
-    "volatility_adjusted_move",
-    "max_adverse_excursion",
-    "catalyst_correctness",
-    "risk_rule_compliance",
-    "rationale_trade_match",
-)
-
-# 12 prompt-bearing TradingAgents agents per blessed-baseline-tradingagents-prompts-v0.2.4.md
-BLESSED_ROLES = (
-    "Market Analyst",
-    "Fundamentals Analyst",
-    "News Analyst",
-    "Social Media Analyst",
-    "Bull Researcher",
-    "Bear Researcher",
-    "Research Manager",
-    "Trader",
-    "Risk Aggressive",
-    "Risk Conservative",
-    "Risk Neutral",
-    "Portfolio Manager",
-)
+# METRICS (7 decision-quality metrics) + BLESSED_ROLES (12 prompt-bearing TradingAgents
+# agents) imported from ledger_constants — single source of truth shared with the
+# init script and the scorer.
 
 
 def parse_args() -> argparse.Namespace:
@@ -297,11 +275,30 @@ def can_apply_proposal_safely(
     )
 
 
+def _sanitize_untrusted_excerpt(text: str) -> str:
+    """Strip sentinel strings + triple-quote delimiters from downstream-LLM-authored content.
+
+    Closes the indirect prompt-injection vector documented in /cso Finding 3: moomoo
+    article text flows into the analyst rationale, which lands here verbatim. The trust-
+    boundary notice tells Hermes to treat the block as data — but if the block contains
+    the literal SENTINEL_BEGIN/END string, parse_hermes_response()'s `stdout.index(...)`
+    can latch onto the wrong byte. If it contains `\"\"\"`, the markdown triple-quote
+    framing breaks. Stripping is safer than escaping because Hermes' prose treatment
+    is unaffected — the analyst's reasoning is the value, not the literal bytes.
+    """
+    return (
+        text.replace(SENTINEL_BEGIN, "[REDACTED-SENTINEL]")
+            .replace(SENTINEL_END, "[REDACTED-SENTINEL]")
+            .replace('"""', "'''")
+    )
+
+
 def build_hermes_prompt(baseline: dict, ledger_state: dict, blessed_baseline_version: str) -> str:
-    rationale_excerpt = (baseline.get("rationale") or "")[:1500]
+    rationale_excerpt = _sanitize_untrusted_excerpt((baseline.get("rationale") or "")[:1500])
     order_excerpt = baseline.get("order_intent_json") or ""
     if len(order_excerpt) > 2000:
         order_excerpt = order_excerpt[:2000] + "...[truncated]"
+    order_excerpt = _sanitize_untrusted_excerpt(order_excerpt)
     return f"""You are Hermes-as-coach for the Ark Trade Agent v0 educational paper-trading stack.
 Your job is to (a) propose minimal refinements to the blessed-baseline TradingAgents prompts,
 and (b) emit a counterfactual shadow decision — what the pipeline WOULD HAVE produced with
@@ -394,20 +391,51 @@ def invoke_hermes(hermes_bin: str, prompt: str) -> subprocess.CompletedProcess:
     )
 
 
+_REQUIRED_SHADOW_KEYS = ("shadow_signal", "shadow_rationale")
+
+
 def parse_hermes_response(stdout: str) -> tuple[dict | None, str, str]:
-    """Extract JSON between sentinels. Returns (parsed_dict, json_text, parse_status)."""
+    """Extract JSON between sentinels + schema-validate the shape. Returns
+    (parsed_dict, json_text, parse_status).
+
+    SENTINEL_END uses rindex so an embedded END-marker string inside Hermes'
+    shadow_rationale (the prompt itself asks Hermes to acknowledge the sentinel
+    contract — so the literal string can appear in prose) doesn't truncate the
+    JSON prematurely.
+
+    Schema validation rejects payloads that would silently corrupt the ledger:
+    a `null` proposed_edits would render as "no edits proposed" in the MD,
+    indistinguishable from Hermes truly having nothing to say.
+    """
     try:
         begin = stdout.index(SENTINEL_BEGIN) + len(SENTINEL_BEGIN)
-        end = stdout.index(SENTINEL_END, begin)
-        json_text = stdout[begin:end].strip()
+        end = stdout.rindex(SENTINEL_END)
     except ValueError:
         return None, stdout, "sentinel-not-found"
+    if end <= begin:
+        return None, stdout, "sentinel-order-invalid"
+    json_text = stdout[begin:end].strip()
     try:
         parsed = json.loads(json_text)
     except json.JSONDecodeError as e:
         return None, json_text, f"json-decode-failed: {e.msg} at line {e.lineno} col {e.colno}"
     if not isinstance(parsed, dict):
         return None, json_text, f"json-not-object: type={type(parsed).__name__}"
+    # Schema validation — distinguishes "Hermes had no edits" (empty list) from
+    # "Hermes returned a malformed payload" (null / missing / wrong type).
+    if "proposed_edits" not in parsed or not isinstance(parsed["proposed_edits"], list):
+        return None, json_text, (
+            f"schema-invalid: proposed_edits must be a list, got "
+            f"{type(parsed.get('proposed_edits')).__name__}"
+        )
+    if "shadow_decision" not in parsed or not isinstance(parsed["shadow_decision"], dict):
+        return None, json_text, (
+            f"schema-invalid: shadow_decision must be a dict, got "
+            f"{type(parsed.get('shadow_decision')).__name__}"
+        )
+    missing = [k for k in _REQUIRED_SHADOW_KEYS if not parsed["shadow_decision"].get(k)]
+    if missing:
+        return None, json_text, f"schema-invalid: shadow_decision missing/empty keys: {missing}"
     return parsed, json_text, "ok"
 
 
@@ -612,7 +640,7 @@ def write_proposal_md(
         md.append(f"- differs_from_baseline: {sd.get('differs_from_baseline', '?')}")
         md.append(f"- delta_summary: {sd.get('delta_summary', '?')}")
         rat = (sd.get("shadow_rationale") or "").strip()
-        md.append(f"- shadow_rationale:")
+        md.append("- shadow_rationale:")
         md.append(f"  > {rat}" if rat else "  > _(empty)_")
     md.append("")
     md.append("## Provenance")
@@ -645,14 +673,22 @@ def main() -> int:
     print(f"[hermes-proposal] window_hours={args.window_hours}")
     print(f"[hermes-proposal] dry_run={args.dry_run}")
 
-    if not Path(args.ledger_path).exists():
-        print(f"[hermes-proposal] FATAL: ledger not found at {args.ledger_path}", file=sys.stderr)
-        return 2
     if not Path(args.hermes_bin).exists():
         print(f"[hermes-proposal] FATAL: hermes binary not found at {args.hermes_bin}", file=sys.stderr)
         return 2
 
-    conn = sqlite3.connect(args.ledger_path)
+    # Use URI mode=rw so SQLite refuses to silently create an empty DB if the
+    # ledger path is wrong (closes the TOCTOU window between a pre-flight
+    # Path().exists() check and the connect call — that idiom would otherwise
+    # let a typo'd path produce a fresh empty ledger + a clean exit 0 with
+    # "no baselines in window", masking the actual configuration error).
+    try:
+        ledger_uri = f"file:{args.ledger_path}?mode=rw"
+        conn = sqlite3.connect(ledger_uri, uri=True)
+    except sqlite3.OperationalError as e:
+        print(f"[hermes-proposal] FATAL: cannot open ledger at {args.ledger_path}: {e}",
+              file=sys.stderr)
+        return 2
     conn.execute("PRAGMA foreign_keys = ON")
     try:
         ledger_state = fetch_ledger_state(conn)
@@ -684,16 +720,34 @@ def main() -> int:
                 })
                 continue
 
-            parsed, _, parse_status = parse_hermes_response(stdout)
+            # If hermes itself exited non-zero (auth fail, model-not-found, OOM),
+            # skip the parse attempt — sentinel-not-found on a crashed process is
+            # not the same failure mode as malformed JSON from a successful one.
+            if rc != 0:
+                parsed = None
+                parse_status = f"hermes-rc={rc}"
+                print(f"[hermes-proposal]   hermes rc={rc}, stderr tail: "
+                      f"{(stderr or '')[-300:]}")
+            else:
+                parsed, _, parse_status = parse_hermes_response(stdout)
             print(f"[hermes-proposal]   parse_status={parse_status}, returncode={rc}, "
                   f"stdout_len={len(stdout)}")
 
             shadow_id = None
             if parsed and not args.dry_run:
-                shadow_id = insert_shadow_decision(
-                    conn, baseline, parsed, args.blessed_baseline_version,
-                )
-                print(f"[hermes-proposal]   inserted shadow row {shadow_id} + 7 deferred metric_scores")
+                # Wrap the INSERT so a sqlite3.IntegrityError (FK violation,
+                # UNIQUE collision) on one baseline does NOT abort the whole loop
+                # and lose the proposal MD for the remaining baselines.
+                try:
+                    shadow_id = insert_shadow_decision(
+                        conn, baseline, parsed, args.blessed_baseline_version,
+                    )
+                    print(f"[hermes-proposal]   inserted shadow row {shadow_id} + 7 deferred metric_scores")
+                except sqlite3.Error as exc:
+                    parse_status = f"ledger-insert-failed: {type(exc).__name__}: {exc}"
+                    parsed = None
+                    print(f"[hermes-proposal]   FAILED ledger insert: {parse_status}",
+                          file=sys.stderr)
             elif parsed and args.dry_run:
                 print("[hermes-proposal]   dry-run: skipping ledger INSERTs")
 
