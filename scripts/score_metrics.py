@@ -4,13 +4,14 @@
 Per spec § Build Order step 22+ (outcome-window scorer; surfaced by W4.22
 Day-1 Hermes review at `vault/Session-Logs/2026-05-07-hermes-review.md`).
 
-v0 scope: `next_day_direction` only. The other six metrics
-(`thesis_accuracy`, `volatility_adjusted_move`, `max_adverse_excursion`,
-`catalyst_correctness`, `risk_rule_compliance`, `rationale_trade_match`)
+v0 scope (wired in code): `next_day_direction` (T+1 directional match),
+`risk_rule_compliance` (T+0 deterministic 3-rule fractions per spec § Hermes
+Evaluation Metrics & Shadow Mode), and `rationale_trade_match` (T+0 lexicon
+sentiment alignment). The remaining four metrics (`thesis_accuracy`,
+`volatility_adjusted_move`, `max_adverse_excursion`, `catalyst_correctness`)
 have their dispatch slots wired but raise NotImplementedError when called.
-This is the smallest unit that unblocks the Hermes-Shadow Delta — once a
-baseline+shadow pair both have a non-NULL `next_day_direction` score, the
-delta SQL in `run_hermes_proposal.py` returns a row.
+The vault page (`vault/Operations/outcome-scorer-config.md`) tracks which
+of the wired metrics is formally blessed/live in shadow mode.
 
 Reads decisions whose `metric_scores.score` is NULL and whose outcome
 window has closed (T+1 RTH close for `next_day_direction`), shells out to
@@ -363,86 +364,214 @@ def score_next_day_direction(
 
 
 # ---------------------------------------------------------------------------
-# Metric: risk_rule_compliance (T+0, heuristic-v0)
+# Metric: risk_rule_compliance (T+0, structured-v0)
 # ---------------------------------------------------------------------------
 
-# Three risk-rule ingredients the rationale/order_intent must mention for a
-# directional trade: entry price, exit/target zone, hard stop. A keyword alone
-# is not enough — the rationale must specify a concrete price level. We
-# enforce that by requiring a `$N` token within PRICE_PROXIMITY_CHARS of the
-# keyword match. Heuristic-v0 — replace with structured-field reads once
-# run_prediction_cycle.py extracts entry/target/stop as JSON fields rather
-# than free-text rationale.
-PRICE_RE = re.compile(r"\$\s*\d")
-PRICE_PROXIMITY_CHARS = 40
-ENTRY_PATTERN = re.compile(
-    r"(?:\bentry\b|\benter\s+at\b|\bbuy\s+near\b|\bnear\s+\$\s*\d+|"
-    r"\blimit\s+\$\s*\d+|\baround\s+\$\s*\d+|\binitiate\b|\bentry\s+price\b)",
+# Three deterministic rules per spec § Hermes Evaluation Metrics & Shadow Mode
+# and the 2026-05-07 Hermes review (Risk Neutral edit 2 — ATR-bound stop):
+#   1. stop_present     — a stop price level extractable from the rationale
+#   2. stop_atr_bound   — |entry - stop| ∈ [ATR_BAND_LOW, ATR_BAND_HIGH]× ATR
+#   3. qty_under_cap    — position size ≤ POSITION_QUANTITY_CAP
+# Each rule contributes 1/3; Hold short-circuits to 1.0 — no position means
+# no risk-management rules apply.
+#
+# v0 quirk: order_intent_json stores only LLM free-text fields (signal,
+# investment_plan, trader_investment_plan, final_trade_decision). Until
+# run_prediction_cycle.py extracts structured entry/stop/atr/quantity keys at
+# decision time, this scorer regex-extracts numerics from prose. Brittle by
+# construction — rationale shape evolves with TradingAgents prompts. Migration
+# target: structured-v1 reads typed JSON fields rather than mining the text.
+#
+# Bidirectional keyword/value extraction handles both phrasings the LLM emits:
+# "$181 hard stop" (W3.18 baseline: $N before keyword) and "stop at $181"
+# (keyword before $N). Closest-side wins per keyword match.
+ATR_BAND_LOW = 1.5   # ×ATR — stop closer than this is too tight (intraday noise floor)
+ATR_BAND_HIGH = 3.0  # ×ATR — stop farther than this is too loose (oversized risk)
+POSITION_QUANTITY_CAP = 5  # shares — v0 paper-trading sanity bound
+KEYWORD_VALUE_WINDOW_CHARS = 80  # search window each side of a keyword match
+
+ENTRY_KEYWORD_RE = re.compile(
+    r"\b(?:entry\s+pinch|entry\s+price|entry\s+at|entry\s*[:=]|"
+    r"buy\s+near|enter\s+at|enter\s+near|trigger\s+at|limit\s+at|"
+    r"initiate\s+at|pinch\s+at|entry)\b",  # bare 'entry' last (proximity check provides safety)
     re.IGNORECASE,
 )
-TARGET_PATTERN = re.compile(
-    r"(?:\btarget\b|\btrim\b|\btake[\s\-]?profit\b|\bexit\s+\$\s*\d+|"
-    r"\bsell\s+at\s+\$\s*\d+|\bupside\s+\$\s*\d+|\btp\s*[:=]\s*\$?\d+|"
-    r"\bprofit[\s\-]?target\b)",
+STOP_KEYWORD_RE = re.compile(
+    r"\b(?:hard\s+stop|stop[-\s]?loss|stop\s+at|stop\s+near|stop\s+to|"
+    r"sl\s*[:=]|cut\s+at|risk\s+to|stop\s*[:=]|stop)\b",  # bare 'stop' last
     re.IGNORECASE,
 )
-STOP_PATTERN = re.compile(
-    r"(?:\bstop[\s\-]?loss\b|\bstop\s+\$\s*\d+|\bsl\s*[:=]\s*\$?\d+|"
-    r"\bcut\s+at\s+\$\s*\d+|\bhard\s+stop\b|\brisk\s+\$\s*\d+|"
-    r"\bdownside\s+\$\s*\d+|\bstop\s+at\s+\$\s*\d+)",
+ATR_KEYWORD_RE = re.compile(
+    r"\b(?:atr|average\s+true\s+range|daily\s+range)\b",
+    re.IGNORECASE,
+)
+QUANTITY_RE = re.compile(
+    r"\b(\d{1,3})\s+shares?\b|"
+    r"\b(?:quantity|qty|size\s+of|position\s+size)\s*[:=]?\s*(\d{1,3})\b",
     re.IGNORECASE,
 )
 
+# Clause-separator chars: when found in the gap between a $N candidate and the
+# keyword anchor, the $N belongs to a different clause (e.g.,
+# "Entry pinch at $196, hard stop at $181" — the comma before "hard stop"
+# means the backward $196 is the entry's value, not the stop's).
+_GAP_CLAUSE_SEPARATORS = re.compile(r"[,;.]")
 
-def _has_anchored_match(pattern: re.Pattern, text: str) -> bool:
-    """True if `pattern` matches AND a `$N` token sits within PRICE_PROXIMITY_CHARS
-    of the match. Closes the bare-keyword false-positive vector: words like
-    "initiate", "profit-target", "hard stop" no longer count without a price."""
-    for m in pattern.finditer(text):
+
+def _extract_price_near_keyword(
+    keyword_re: re.Pattern,
+    text: str,
+    *,
+    require_dollar: bool = True,
+    window: int = KEYWORD_VALUE_WINDOW_CHARS,
+) -> Optional[float]:
+    """Closest numeric value within `window` chars of any keyword match.
+
+    For each keyword hit, look forward (keyword → $N) and backward ($N → keyword)
+    up to `window` chars. A candidate is REJECTED if the gap text between the
+    keyword and the $N contains a clause separator (`,`, `;`, `.`) — that signals
+    the $N belongs to a different clause. Among valid candidates, the closer
+    side wins. Returns None if no valid candidate in any keyword window.
+
+    `require_dollar=True` restricts matches to $-prefixed numbers (entry, stop);
+    `False` accepts bare numbers too (ATR, which the rationale may write as
+    'ATR ~5.30' without a dollar sign).
+    """
+    pattern = r"\$\s*(\d{1,5}(?:\.\d+)?)" if require_dollar else r"\$?\s*(\d{1,5}(?:\.\d+)?)"
+    pat = re.compile(pattern)
+    for m in keyword_re.finditer(text):
         start, end = m.span()
-        # If the match itself contains a `$N` (e.g. "near $200"), accept directly.
-        if PRICE_RE.search(text[start:end]):
-            return True
-        left = max(0, start - PRICE_PROXIMITY_CHARS)
-        right = min(len(text), end + PRICE_PROXIMITY_CHARS)
-        if PRICE_RE.search(text[left:right]):
-            return True
-    return False
+        # Forward candidate
+        tail = text[end:end + window]
+        forward = pat.search(tail)
+        fwd_dist = None
+        if forward:
+            fwd_gap = tail[:forward.start()]
+            if _GAP_CLAUSE_SEPARATORS.search(fwd_gap):
+                forward = None
+            else:
+                fwd_dist = forward.start()
+        # Backward candidate
+        head = text[max(0, start - window):start]
+        backward_all = list(pat.finditer(head))
+        backward = backward_all[-1] if backward_all else None
+        bwd_dist = None
+        if backward:
+            bwd_gap = head[backward.end():]
+            if _GAP_CLAUSE_SEPARATORS.search(bwd_gap):
+                backward = None
+            else:
+                bwd_dist = len(head) - backward.end()
+        # Pick closer valid candidate
+        if forward and (backward is None or fwd_dist <= bwd_dist):
+            try:
+                return float(forward.group(1))
+            except ValueError:
+                continue
+        if backward:
+            try:
+                return float(backward.group(1))
+            except ValueError:
+                continue
+    return None
+
+
+def _extract_quantity(text: str) -> Optional[int]:
+    """First quantity-like token: 'N shares', 'quantity N', 'size of N', 'qty N'."""
+    m = QUANTITY_RE.search(text)
+    if not m:
+        return None
+    raw = m.group(1) or m.group(2)
+    try:
+        return int(raw)
+    except (ValueError, TypeError):
+        return None
 
 
 def score_risk_rule_compliance(
-    decision: DecisionRow, **_kwargs
+    decision: DecisionRow,
+    *,
+    quantity_cap: int = POSITION_QUANTITY_CAP,
+    atr_band_low: float = ATR_BAND_LOW,
+    atr_band_high: float = ATR_BAND_HIGH,
+    **_kwargs,
 ) -> ScoreResult:
-    """Heuristic T+0 score: count of (entry, target, stop) mentions / 3.
+    """T+0 structured-rule score: 3 deterministic risk-rule checks.
 
-    Hold signals short-circuit to 1.0 — there is no position to risk-manage,
-    so the three structural risk-rules don't apply. Scoring Hold as 0/3 would
-    incorrectly punish a valid no-trade decision.
+    Rules (each worth 1/3):
+      1. stop_present     — a stop price level extractable from rationale
+      2. stop_atr_bound   — |entry - stop| within [atr_band_low, atr_band_high]× ATR
+      3. qty_under_cap    — position size ≤ quantity_cap (falls back to broker
+         default qty=1 from run_prediction_cycle.py:234 when text has no size token)
+    Hold signals short-circuit to 1.0 (no position to risk-manage).
     """
     signal = extract_signal(decision)
     window_end_ts = f"{decision.trade_date}T21:00:00+00:00"
+
+    if signal is None:
+        return ScoreResult(
+            score=None,
+            score_label=None,
+            outcome_window_end_timestamp=None,
+            notes="signal-unrecognized; no scoring possible",
+        )
+
     if signal == "hold":
         return ScoreResult(
             score=1.0,
-            score_label="heuristic-v0/hold-no-position-rules-apply",
+            score_label="structured-v0/hold-no-trade",
             outcome_window_end_timestamp=window_end_ts,
-            notes="Hold decision — no entry/target/stop required (no position to risk-manage)",
+            notes="no-trade-signal-hold",
         )
 
-    text = (decision.rationale or "") + " " + (decision.order_intent_json or "")
-    has_entry = _has_anchored_match(ENTRY_PATTERN, text)
-    has_target = _has_anchored_match(TARGET_PATTERN, text)
-    has_stop = _has_anchored_match(STOP_PATTERN, text)
-    count = int(has_entry) + int(has_target) + int(has_stop)
-    score = count / 3.0
+    text = _extract_decision_text(decision)
+    entry = _extract_price_near_keyword(ENTRY_KEYWORD_RE, text)
+    stop = _extract_price_near_keyword(STOP_KEYWORD_RE, text)
+    atr = _extract_price_near_keyword(ATR_KEYWORD_RE, text, require_dollar=False)
+    qty = _extract_quantity(text)
+
+    rule_stop_present = stop is not None
+
+    band_low_val = band_high_val = distance = None
+    if entry is not None and stop is not None and atr is not None and atr > 0:
+        distance = abs(entry - stop)
+        band_low_val = atr_band_low * atr
+        band_high_val = atr_band_high * atr
+        rule_stop_atr_bound = band_low_val <= distance <= band_high_val
+    else:
+        rule_stop_atr_bound = False
+
+    # Qty fallback: place_paper_order() defaults qty=1 at
+    # run_prediction_cycle.py:234, so when text omits a size token the broker
+    # reality is qty=1 ≤ cap. Surface the inference in notes so it's auditable.
+    qty_inferred = qty is None
+    effective_qty = 1 if qty_inferred else qty
+    rule_qty_under_cap = effective_qty <= quantity_cap
+
+    passes = int(rule_stop_present) + int(rule_stop_atr_bound) + int(rule_qty_under_cap)
+    score = round(passes / 3.0, 2)  # snap to user-facing 0.0/0.33/0.67/1.0
+
     label = (
-        f"heuristic-v0/{count}-of-3:"
-        f"entry={has_entry},target={has_target},stop={has_stop}"
+        f"structured-v0/{passes}-of-3:"
+        f"stop_present={rule_stop_present},"
+        f"stop_atr_bound={rule_stop_atr_bound},"
+        f"qty_under_cap={rule_qty_under_cap}"
+    )
+    band_str = (
+        f"band=[{band_low_val:.2f},{band_high_val:.2f}]@distance={distance:.2f}"
+        if band_low_val is not None
+        else "band=N/A(entry/stop/atr missing)"
+    )
+    qty_str = (
+        f"qty={effective_qty}(inferred-from-broker-default)"
+        if qty_inferred
+        else f"qty={effective_qty}"
     )
     notes = (
-        f"heuristic-v0 regex pass with $N-proximity anchor over rationale+order_intent_json "
-        f"(text_len={len(text)}); ingredients found: "
-        f"entry={has_entry}, target={has_target}, stop={has_stop}"
+        f"structured-v0 regex extraction over rationale+order_intent_json "
+        f"(text_len={len(text)}); signal={signal}; "
+        f"entry={entry}; stop={stop}; atr={atr}; {qty_str}; "
+        f"{band_str}; cap={quantity_cap}; atr_band=[{atr_band_low}x..{atr_band_high}x]"
     )
     return ScoreResult(
         score=score,
