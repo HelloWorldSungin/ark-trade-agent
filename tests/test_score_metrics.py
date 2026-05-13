@@ -3,8 +3,10 @@
 Highest-leverage tests:
 1. `score_risk_rule_compliance` structured-v0 — 3 deterministic rules
 3. `extract_signal` non-canonical 5-tier variants (Top-5 finding #3)
+4. `score_volatility_adjusted_move` — T+5 z-score-normalized directional match
 """
 import json
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -21,6 +23,7 @@ from score_metrics import (
     _extract_quantity,
     extract_signal,
     score_risk_rule_compliance,
+    score_volatility_adjusted_move,
 )
 
 
@@ -337,3 +340,134 @@ def test_extract_decision_text_strips_trust_boundary_block():
     assert "bearish" not in text
     assert "miss" not in text
     assert "rally" in text  # post-block content survives
+
+
+# ---------------------------------------------------------------------------
+# Test #4 — score_volatility_adjusted_move (T+5 z-score-normalized directional)
+# ---------------------------------------------------------------------------
+
+
+def _vol_decision(signal: str = "Buy", trade_date: str = "2026-05-06") -> DecisionRow:
+    return DecisionRow(
+        decision_id="v",
+        ticker="NVDA",
+        trade_date=trade_date,
+        decision_kind="baseline",
+        order_intent_json=json.dumps({"signal": signal}),
+        rationale="",
+    )
+
+
+def _vol_kline_rows(closes: list[float], start_date: str = "2026-05-06") -> list[dict]:
+    """Build T+0..T+(len-1) kline rows. Calendar-day-stepped dates are fine — the
+    scorer identifies T+0 as the first row whose date >= trade_date, then takes
+    the next 5 rows as T+1..T+5, independent of whether those calendar dates
+    fall on a weekend in reality."""
+    base = datetime.strptime(start_date, "%Y-%m-%d").date()
+    return [
+        {"date": (base + timedelta(days=i)).isoformat(), "close": c}
+        for i, c in enumerate(closes)
+    ]
+
+
+def test_volatility_adjusted_defers_when_window_not_closed(monkeypatch):
+    """T+5 in the future → defer with notes containing 'window-not-closed'."""
+    klines = _vol_kline_rows([100.0, 101.0, 102.0, 103.0, 104.0, 105.0])
+    monkeypatch.setattr("score_metrics.fetch_daily_klines", lambda *a, **k: klines)
+    # T+5 == 2026-05-11; today = 2026-05-10 → window not yet closed
+    result = score_volatility_adjusted_move(
+        _vol_decision(signal="Buy"),
+        kline_script="x", uv_bin="x",
+        vol_adj_threshold=1.0,
+        today=datetime(2026, 5, 10, 22, 0, tzinfo=timezone.utc),
+    )
+    assert result.score is None
+    assert "window-not-closed" in result.notes
+
+
+def test_volatility_adjusted_defers_on_zero_close_in_denominator(monkeypatch):
+    """A zero in closes[1..4] (rare moomoo data glitch) would crash with
+    ZeroDivisionError inside the daily_returns comprehension. Scorer must defer
+    on any non-positive close in the denominator positions T+0..T+4."""
+    klines = _vol_kline_rows([100.0, 101.0, 0.0, 103.0, 104.0, 105.0])
+    monkeypatch.setattr("score_metrics.fetch_daily_klines", lambda *a, **k: klines)
+    result = score_volatility_adjusted_move(
+        _vol_decision(signal="Buy"),
+        kline_script="x", uv_bin="x",
+        vol_adj_threshold=1.0,
+        today=datetime(2026, 5, 13, 22, 0, tzinfo=timezone.utc),
+    )
+    assert result.score is None
+    assert "non-positive close in denominator at T+2" in result.notes
+
+
+def test_volatility_adjusted_defers_on_degenerate_vol(monkeypatch):
+    """All-equal closes → realized_vol=0 → defer with notes='degenerate-vol'.
+    No directional signal can be extracted from a no-vol stock."""
+    klines = _vol_kline_rows([100.0, 100.0, 100.0, 100.0, 100.0, 100.0])
+    monkeypatch.setattr("score_metrics.fetch_daily_klines", lambda *a, **k: klines)
+    result = score_volatility_adjusted_move(
+        _vol_decision(signal="Buy"),
+        kline_script="x", uv_bin="x",
+        vol_adj_threshold=1.0,
+        # After T+5 close so the window-not-closed guard doesn't shadow this
+        today=datetime(2026, 5, 13, 22, 0, tzinfo=timezone.utc),
+    )
+    assert result.score is None
+    assert "degenerate-vol" in result.notes
+
+
+def test_volatility_adjusted_score_1_when_predicted_matches_realized(monkeypatch):
+    """Buy predicts +1; sustained ~1% daily uptrend → vol_adj_move >> 1 →
+    realized_dir=+1 → score 1.0."""
+    klines = _vol_kline_rows([100.0, 101.0, 102.0, 103.0, 104.0, 105.0])
+    monkeypatch.setattr("score_metrics.fetch_daily_klines", lambda *a, **k: klines)
+    result = score_volatility_adjusted_move(
+        _vol_decision(signal="Buy"),
+        kline_script="x", uv_bin="x",
+        vol_adj_threshold=1.0,
+        today=datetime(2026, 5, 13, 22, 0, tzinfo=timezone.utc),
+    )
+    assert result.score == 1.0, f"got {result.score}; notes={result.notes}"
+    assert result.score_label.startswith("up_predicted_up_realized_")
+    assert "zmove=+" in result.score_label
+    assert result.outcome_window_end_timestamp == "2026-05-11T21:00:00+00:00"
+
+
+def test_volatility_adjusted_score_0_when_predicted_mismatches_realized(monkeypatch):
+    """Underweight predicts -1; sustained ~1% daily uptrend → realized_dir=+1 → 0.0.
+    Same NVDA-baseline-on-rally shape as next_day_direction's 0.0-on-all-3-rows
+    pattern in the 2026-05-12 first-smoke."""
+    klines = _vol_kline_rows([100.0, 101.0, 102.0, 103.0, 104.0, 105.0])
+    monkeypatch.setattr("score_metrics.fetch_daily_klines", lambda *a, **k: klines)
+    result = score_volatility_adjusted_move(
+        _vol_decision(signal="Underweight"),
+        kline_script="x", uv_bin="x",
+        vol_adj_threshold=1.0,
+        today=datetime(2026, 5, 13, 22, 0, tzinfo=timezone.utc),
+    )
+    assert result.score == 0.0, f"got {result.score}; notes={result.notes}"
+    assert result.score_label.startswith("down_predicted_up_realized_")
+
+
+@pytest.mark.parametrize("closes,expected_score,realized_label", [
+    # Hold-in-band: tiny realized move, jittery returns → |zmove| < 1.0 → realized=flat → match
+    ([100.0, 100.5, 99.5, 100.3, 99.8, 100.1], 1.0, "flat"),
+    # Hold-out-of-band: directional trend → |zmove| >> 1.0 → realized=up → mismatch
+    ([100.0, 101.0, 102.0, 103.0, 104.0, 105.0], 0.0, "up"),
+])
+def test_volatility_adjusted_hold_in_and_out_of_band(monkeypatch, closes, expected_score,
+                                                    realized_label):
+    """Hold predicts flat (predicted_dir=0). Inside band → 1.0; outside → 0.0.
+    Hold IS evaluated against realized vol-adjusted move (no short-circuit;
+    mirrors next_day_direction's Hold semantics)."""
+    klines = _vol_kline_rows(closes)
+    monkeypatch.setattr("score_metrics.fetch_daily_klines", lambda *a, **k: klines)
+    result = score_volatility_adjusted_move(
+        _vol_decision(signal="Hold"),
+        kline_script="x", uv_bin="x",
+        vol_adj_threshold=1.0,
+        today=datetime(2026, 5, 13, 22, 0, tzinfo=timezone.utc),
+    )
+    assert result.score == expected_score, f"got {result.score}; notes={result.notes}"
+    assert f"flat_predicted_{realized_label}_realized_" in result.score_label
