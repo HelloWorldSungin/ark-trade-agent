@@ -27,7 +27,7 @@ Read the relevant page **before** modifying any subsystem — these capture depl
 | Eval Ledger | [eval-ledger-config.md](vault/Operations/eval-ledger-config.md) | SQLite at `/opt/ark-data/eval-ledger.sqlite`, schema v0.1.0, 3-table normalized |
 | Hermes | [hermes-config.md](vault/Operations/hermes-config.md) | v0.12.0 "Curator", Curator disabled (auto-apply NEVER), dashboard on loopback :9119 |
 | Hermes proposals | [hermes-proposal-pipeline.md](vault/Operations/hermes-proposal-pipeline.md) | Counterfactual shadow + dated MD; telemetry-proposal framing below sample-size gate |
-| Outcome scorer | [outcome-scorer-config.md](vault/Operations/outcome-scorer-config.md) | 3 of 7 metrics live (`next_day_direction` + `risk_rule_compliance` + `rationale_trade_match`); 4 T+5/T+10 metrics queued |
+| Outcome scorer | [outcome-scorer-config.md](vault/Operations/outcome-scorer-config.md) | 4 of 7 metrics live (`next_day_direction` + `risk_rule_compliance` + `rationale_trade_match` + `volatility_adjusted_move`); 3 T+5/T+10 metrics queued |
 
 ## Cross-cutting debt + open items
 

@@ -6,10 +6,11 @@ Day-1 Hermes review at `vault/Session-Logs/2026-05-07-hermes-review.md`).
 
 v0 scope (wired in code): `next_day_direction` (T+1 directional match),
 `risk_rule_compliance` (T+0 deterministic 3-rule fractions per spec § Hermes
-Evaluation Metrics & Shadow Mode), and `rationale_trade_match` (T+0 lexicon
-sentiment alignment). The remaining four metrics (`thesis_accuracy`,
-`volatility_adjusted_move`, `max_adverse_excursion`, `catalyst_correctness`)
-have their dispatch slots wired but raise NotImplementedError when called.
+Evaluation Metrics & Shadow Mode), `rationale_trade_match` (T+0 lexicon
+sentiment alignment), and `volatility_adjusted_move` (T+5 z-score-normalized
+directional match). The remaining three metrics (`thesis_accuracy`,
+`max_adverse_excursion`, `catalyst_correctness`) have their dispatch slots
+wired but raise NotImplementedError when called.
 The vault page (`vault/Operations/outcome-scorer-config.md`) tracks which
 of the wired metrics is formally blessed/live in shadow mode.
 
@@ -27,6 +28,7 @@ CLI:
         [--ledger-path PATH]        (override $ARK_EVAL_LEDGER_PATH)
         [--kline-script PATH]       (override moomoo get_kline.py location)
         [--flat-threshold FLOAT]    (next_day_direction flat band; default 0.005)
+        [--vol-adj-threshold FLOAT] (volatility_adjusted_move σ band; default 1.0)
         [--dry-run]                 (compute + print; no UPDATEs)
 
 Runs on LOQ where OpenD + the moomoo SDK live. Mac dev edits + scp to LOQ.
@@ -38,6 +40,7 @@ import json
 import os
 import re
 import sqlite3
+import statistics
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -57,6 +60,8 @@ DEFAULT_UV_BIN = "/home/ark-dev/.local/bin/uv"
 DEFAULT_FLAT_THRESHOLD = 0.005  # 0.5% — moves within this band count as flat
 KLINE_TIMEOUT_S = 60
 KLINE_WINDOW_DAYS = 10  # calendar days fetched starting at trade_date — buffer for weekends/holidays
+KLINE_WINDOW_DAYS_T5 = 12  # 5 trading days + weekend/holiday buffer + 1 to find T+0
+DEFAULT_VOL_ADJ_THRESHOLD = 1.0  # σ — vol-normalized "noise floor" for the realized-direction bucket
 
 # ALL_METRICS retained as an alias for argparse choices/CLI surface compat.
 # METRICS + SIGNAL_DIRECTION imported from ledger_constants — single source of truth.
@@ -692,6 +697,189 @@ def score_rationale_trade_match(
 
 
 # ---------------------------------------------------------------------------
+# Metric: volatility_adjusted_move (T+5, z-score-normalized directional match)
+# ---------------------------------------------------------------------------
+
+
+def score_volatility_adjusted_move(
+    decision: DecisionRow,
+    *,
+    kline_script: str,
+    uv_bin: str,
+    vol_adj_threshold: float,
+    today: datetime,
+    **_kwargs,
+) -> ScoreResult:
+    """Score volatility_adjusted_move by comparing predicted direction vs realized
+    vol-normalized move at T+5 close.
+
+    realized_move = (t5_close - t0_close) / t0_close
+    daily_returns = 5 returns from the 6 closes T+0..T+5
+    realized_vol  = statistics.stdev(daily_returns)  # sample, ddof=1
+    vol_adj_move  = realized_move / realized_vol     # signed z-score-like, dimensionless
+    realized_dir  = +1 if vol_adj_move > +threshold; -1 if < -threshold; 0 otherwise
+
+    Outcome window closes at T+5 RTH close (~21:00 UTC). Refuses to score until
+    5 trading-day closes are in (mirrors the T+1 guard in score_next_day_direction).
+    Hold predicts flat; "flat" means |vol_adj_move| ≤ threshold (no short-circuit —
+    Hold IS evaluated against realized vol-adjusted move, same as next_day_direction).
+    realized_vol == 0 defers with notes='degenerate-vol' (no signal from a no-vol stock).
+    """
+    signal = extract_signal(decision)
+    if signal is None:
+        return ScoreResult(
+            score=None,
+            score_label=None,
+            outcome_window_end_timestamp=None,
+            notes="signal-unrecognized; no scoring possible",
+        )
+    predicted_dir = SIGNAL_DIRECTION[signal]
+
+    try:
+        trade_d = datetime.strptime(decision.trade_date, "%Y-%m-%d").date()
+    except ValueError:
+        return ScoreResult(
+            score=None,
+            score_label=None,
+            outcome_window_end_timestamp=None,
+            notes=f"trade_date malformed: {decision.trade_date!r}",
+        )
+
+    window_start = trade_d.isoformat()
+    window_end = (trade_d + timedelta(days=KLINE_WINDOW_DAYS_T5)).isoformat()
+
+    moomoo_code = (
+        decision.ticker
+        if decision.ticker.startswith(("US.", "HK.", "CN."))
+        else f"US.{decision.ticker}"
+    )
+    klines = fetch_daily_klines(
+        moomoo_code,
+        window_start,
+        window_end,
+        kline_script=kline_script,
+        uv_bin=uv_bin,
+    )
+
+    # T+0 = first row at or after trade_date; T+1..T+5 = the next 5 rows.
+    t0_idx = None
+    for i, row in enumerate(klines):
+        if row["date"] >= decision.trade_date:
+            t0_idx = i
+            break
+    if t0_idx is None or t0_idx + 5 >= len(klines):
+        return ScoreResult(
+            score=None,
+            score_label=None,
+            outcome_window_end_timestamp=None,
+            notes=(
+                f"window-not-closed; need T+0..T+5 (6 closes) in window "
+                f"[{window_start}..{window_end}]; got {len(klines)} rows"
+            ),
+        )
+
+    window_rows = klines[t0_idx : t0_idx + 6]  # T+0..T+5 inclusive
+
+    # T+5 must already have happened. Same RTH-close guard as next_day_direction's
+    # T+1 check — if T+5 is today, refuse to score until the close has happened
+    # (US RTH closes at ≈21:00 UTC standard / 20:00 UTC daylight saving).
+    try:
+        t5_date = datetime.strptime(window_rows[-1]["date"], "%Y-%m-%d").date()
+    except ValueError:
+        return ScoreResult(
+            score=None,
+            score_label=None,
+            outcome_window_end_timestamp=None,
+            notes=f"T+5 date malformed: {window_rows[-1]['date']!r}",
+        )
+    if t5_date > today.date():
+        return ScoreResult(
+            score=None,
+            score_label=None,
+            outcome_window_end_timestamp=None,
+            notes=f"window-not-closed; T+5 ({t5_date.isoformat()}) is in the future",
+        )
+    RTH_CLOSE_UTC_HOUR = 21  # conservative — covers EST; EDT will be one hour earlier
+    if t5_date == today.date() and today.hour < RTH_CLOSE_UTC_HOUR:
+        return ScoreResult(
+            score=None,
+            score_label=None,
+            outcome_window_end_timestamp=None,
+            notes=(
+                f"window-not-closed; T+5 is today and current UTC hour "
+                f"{today.hour} < {RTH_CLOSE_UTC_HOUR} (US RTH close)"
+            ),
+        )
+
+    closes = [r["close"] for r in window_rows]
+    # closes[0..4] are denominators in daily_returns + realized_move; a zero or
+    # negative in any of those positions would crash with ZeroDivisionError,
+    # which main()'s except clause does NOT catch (only TimeoutExpired +
+    # RuntimeError) — would kill the entire scoring run on one bad row. Defer.
+    for i, c in enumerate(closes[:5]):
+        if c <= 0:
+            return ScoreResult(
+                score=None,
+                score_label=None,
+                outcome_window_end_timestamp=None,
+                notes=(
+                    f"non-positive close in denominator at T+{i} "
+                    f"({window_rows[i]['date']}@{c}); skip"
+                ),
+            )
+
+    realized_move = (closes[5] - closes[0]) / closes[0]
+    daily_returns = [(closes[i + 1] - closes[i]) / closes[i] for i in range(5)]
+    realized_vol = statistics.stdev(daily_returns)  # sample stdev, ddof=1
+
+    if realized_vol == 0:
+        return ScoreResult(
+            score=None,
+            score_label=None,
+            outcome_window_end_timestamp=None,
+            notes=(
+                f"degenerate-vol; realized_vol=0 over T+0..T+5; "
+                f"daily_returns={daily_returns}"
+            ),
+        )
+
+    vol_adj_move = realized_move / realized_vol
+
+    if vol_adj_move > vol_adj_threshold:
+        realized_dir = +1
+        realized_label = "up"
+    elif vol_adj_move < -vol_adj_threshold:
+        realized_dir = -1
+        realized_label = "down"
+    else:
+        realized_dir = 0
+        realized_label = "flat"
+
+    predicted_label = {+1: "up", 0: "flat", -1: "down"}[predicted_dir]
+    matched = predicted_dir == realized_dir
+    score = 1.0 if matched else 0.0
+    label = (
+        f"{predicted_label}_predicted_{realized_label}_realized_"
+        f"vol={realized_vol:.4f}_zmove={vol_adj_move:+.2f}"
+    )
+
+    window_end_ts = f"{window_rows[-1]['date']}T21:00:00+00:00"
+
+    notes = (
+        f"signal={signal}; t0={window_rows[0]['date']}@{closes[0]:.4f}; "
+        f"t5={window_rows[-1]['date']}@{closes[5]:.4f}; "
+        f"realized_move={realized_move:+.4%}; realized_vol={realized_vol:.4%}; "
+        f"vol_adj_move={vol_adj_move:+.4f}; threshold=±{vol_adj_threshold}"
+    )
+    return ScoreResult(
+        score=score,
+        score_label=label,
+        outcome_window_end_timestamp=window_end_ts,
+        notes=notes,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Metric dispatch
 # ---------------------------------------------------------------------------
 
@@ -700,7 +888,8 @@ def _not_implemented(metric: str) -> Callable:
     def _impl(*_args, **_kwargs):
         raise NotImplementedError(
             f"scorer for {metric!r} is not implemented in v0 — only "
-            f"next_day_direction, risk_rule_compliance, rationale_trade_match"
+            f"next_day_direction, risk_rule_compliance, rationale_trade_match, "
+            f"volatility_adjusted_move"
         )
 
     return _impl
@@ -710,8 +899,8 @@ METRIC_DISPATCH: dict[str, Callable] = {
     "next_day_direction": score_next_day_direction,
     "risk_rule_compliance": score_risk_rule_compliance,
     "rationale_trade_match": score_rationale_trade_match,
+    "volatility_adjusted_move": score_volatility_adjusted_move,
     "thesis_accuracy": _not_implemented("thesis_accuracy"),
-    "volatility_adjusted_move": _not_implemented("volatility_adjusted_move"),
     "max_adverse_excursion": _not_implemented("max_adverse_excursion"),
     "catalyst_correctness": _not_implemented("catalyst_correctness"),
 }
@@ -824,6 +1013,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--uv-bin", default=DEFAULT_UV_BIN, help="Absolute path to uv binary")
     p.add_argument("--flat-threshold", type=float, default=DEFAULT_FLAT_THRESHOLD)
     p.add_argument(
+        "--vol-adj-threshold",
+        type=float,
+        default=DEFAULT_VOL_ADJ_THRESHOLD,
+        help="volatility_adjusted_move σ band (default 1.0)",
+    )
+    p.add_argument(
         "--dry-run",
         action="store_true",
         help="Compute and print; do not UPDATE the ledger",
@@ -861,6 +1056,7 @@ def main(argv: list[str]) -> int:
                 kline_script=args.kline_script,
                 uv_bin=args.uv_bin,
                 flat_threshold=args.flat_threshold,
+                vol_adj_threshold=args.vol_adj_threshold,
                 today=today,
             )
         except NotImplementedError as exc:
