@@ -183,6 +183,132 @@ LOQ install, Week 3 step 17. Per spec § Build Order step 17 + § Hermes Evaluat
 - Blessed-baseline prompt SHAs: `vault/Specs/blessed-baseline-tradingagents-prompts-v0.2.4.md` (Hermes proposals diff against this static set)
 - Sample-size gate: ≥30–50 completed decision/outcome pairs before any prompt-quality claim. v0 auto-apply: NEVER (Shadow Mode only).
 
+## Hermes Configuration
+
+LOQ install, Week 4 step 19. Per spec § Build Order step 19 + § Hermes Evaluation Metrics & Shadow Mode: Hermes is the meta-learner ("coach") layer that reads the eval ledger + realized fills, treats each TradingAgents role prompt as a skill, and proposes refinements. v0 stays in Shadow Mode — proposals are written to disk but NEVER auto-applied. Smoke green 2026-05-07T19:36Z (`hermes -z "Reply with exactly OK..."` returned `OK` in 7s wall through Chutes/Kimi-K2.6-TEE).
+
+| Field | Value |
+|---|---|
+| Source repo | `https://github.com/NousResearch/hermes-agent.git` |
+| Pinned tag | `v2026.4.30` ≡ release v0.12.0 ("Curator") — picked over today's `v2026.5.7` ("Tenacity") because Curator was 1-week field-tested by Nous when we installed; Tenacity released hours earlier with no stability data |
+| Pinned commit | `73bf3ab1b22314ed9dfecbb59242c03742fe72af` (record alongside the tag for deterministic re-apply if the tag is ever re-pointed) |
+| Install path (LOQ) | `/home/ark-dev/.hermes/hermes-agent` (the entire `~/.hermes/` tree is mode 0700, owned ark-dev) |
+| Shim path (LOQ) | `/home/ark-dev/.local/bin/hermes` — 4-line bash wrapper that unsets `PYTHONPATH` + `PYTHONHOME` and execs the venv-installed `hermes` entry point |
+| Python venv | `/home/ark-dev/.hermes/hermes-agent/venv/` — Python 3.11.15, OpenAI SDK 2.33.0. **NB: venv was built against HEAD (`04193cf71`, v2026.5.7-4) at install time, then the source tree was checked out to `v2026.4.30` post-install. The editable install + venv-resolved deps still satisfy v2026.4.30's pyproject.toml**, but the venv is not strictly tag-aligned. Rebuild on dep mismatch: `rm -rf venv && uv venv venv && source venv/bin/activate && uv pip install -e ".[all]"`. |
+| Config file (LOQ) | `/home/ark-dev/.hermes/config.yaml` (54KB pre-populated by installer with 700+ commented lines documenting every option). Our overrides applied via `hermes config set <key> <value>` — do NOT hand-edit the YAML to set the same keys; the CLI rewrites in place and preserves comments. |
+| Secrets file (LOQ) | `/home/ark-dev/.hermes/.env` — mode 0600, owned ark-dev. **Hermes' installer wrote it 0664 by default; we chmod'd 0600 at config time. Re-check on bump.** Holds `OPENAI_API_KEY=<chutes-key>` (custom-provider convention per `config.yaml` line ~401) AND `CHUTES_API_KEY=<chutes-key>` (canonical name for symmetry with OpenClaw + TradingAgents — Hermes itself only reads `OPENAI_API_KEY`, the second key is documentation). |
+| Model routing | `model.provider=custom`, `model.base_url=https://llm.chutes.ai/v1`, `model.default=moonshotai/Kimi-K2.6-TEE`, `model.context_length=256000`. K2.6's 256K ctx is 4× Hermes' 64K floor. K2.5-TEE (262K max-output) is the single-config-line fallback if 10K max-output ever pinches. |
+| Curator (v0 setting) | `auxiliary.curator.enabled=false`. Hermes' v0.12.0 ships an autonomous Curator that grades/prunes/consolidates the agent's own skill library on a 168h (7-day) cycle. Per docs the Curator never touches bundled or hub-installed skills (only skills the agent itself authored), and never auto-deletes (worst case: archival to `~/.hermes/skills/.archive/`). Even so, **disabled in v0** because spec § Hermes Evaluation Metrics mandates "auto-apply NEVER" and we have <50 outcome pairs (1 from W3.18 NVDA smoke). Curator can re-enable once the sample-size gate clears. |
+| Smoke pattern | `hermes -z "<prompt>"` (one-shot non-interactive mode introduced in v0.12.0). Returns response text on stdout, exits 0. Use this for any deterministic ledger-reader / proposal-writer entry point in W4.20. |
+| Heartbeat / cron | NOT configured at install. Hermes ships its own `hermes gateway install` for messaging + cron, but we use OpenClaw as the gateway and Discord as messaging — Hermes will be **invoked manually on demand** for v0 (mirrors W2.12 heartbeat manual-fire pattern; persistent cron is parked behind OpenClaw scope-upgrade per [Heartbeat Configuration](#heartbeat-configuration)). |
+| Pre-install rc backups (LOQ) | `~/.bashrc.pre-hermes-20260507T192849Z`, `~/.zshrc.pre-hermes-20260507T192849Z`, `~/.profile.pre-hermes-20260507T192849Z`. Installer modifies all three (PATH-prefix `~/.local/bin`). Restore from backups if a clean uninstall is ever needed. |
+| Install log (LOQ) | `/tmp/hermes-install/install.log` (final attempt, success). The first attempt with `--no-venv` failed because Hermes has Python deps (uv pip install -e '.[all]') that need a venv — preserved as `install.log.failed-novenv` for postmortem. |
+
+**Install command + tag-pin protocol (re-apply on bump):**
+
+```bash
+# 1. Clean install via official curl-bash
+curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh \
+  | bash -s -- --skip-setup
+#    --skip-setup : do not auto-launch interactive wizard; we'll write config via `hermes config set`
+#    Do NOT pass --no-venv; Hermes has Python deps that need a venv.
+
+# 2. Real tag-pin (install.sh's --branch flag does NOT support tags — only branches)
+cd ~/.hermes/hermes-agent
+git fetch --tags --prune
+git restore .                  # discard any dirty changes from npm install during step 1
+git checkout v2026.4.30        # or whichever tag is the bump target
+# NB: if v2026.4.30's pyproject.toml differs from the install-time HEAD, rebuild the venv:
+#   rm -rf venv && uv venv venv && source venv/bin/activate && uv pip install -e ".[all]"
+
+# 3. Reapply config via hermes config set (do NOT hand-edit config.yaml)
+hermes config set model.default moonshotai/Kimi-K2.6-TEE
+hermes config set model.provider custom
+hermes config set model.base_url https://llm.chutes.ai/v1
+hermes config set model.context_length 256000
+hermes config set auxiliary.curator.enabled false
+
+# 4. Re-source CHUTES_API_KEY into ~/.hermes/.env as OPENAI_API_KEY + CHUTES_API_KEY (mode 0600)
+```
+
+**Secrets debt (now 4 plaintext-chutes-key surfaces — addressed in /cso pass, chain step 14):**
+- `~/.openclaw/openclaw.json` (OpenClaw, W2.7)
+- `/opt/tradingagents/.env` (TradingAgents, W3.14) — the canonical source we cat from
+- `~/.pi/agent/auth.json` (pi-agent, W2.9)
+- `~/.hermes/.env` (Hermes, W4.19) — **NEW**
+
+All four hold the same Chutes API key. SecretRef migration (mirroring OpenClaw's gateway-token pattern) consolidates them onto a single source-of-truth file with services reading via `EnvironmentFile=` drop-ins. Until then, key rotation requires updating all four files.
+
+## Hermes Proposal Pipeline
+
+LOQ install, Week 4 step 20. Per spec § Build Order step 20 + § Hermes Evaluation Metrics & Shadow Mode: Hermes reads each baseline decision from the eval ledger, emits a counterfactual *shadow decision* + *proposed prompt edits* in a single LLM call, INSERTs the shadow row + 7 deferred metric_scores rows, and writes a structured Day-N proposal to `/opt/ark-data/hermes-proposals/YYYY-MM-DD.md`. End-to-end smoke green 2026-05-07T19:58Z (NVDA baseline → shadow `shadow-20260507T195829Z-8eb0f204` → proposal MD with 3 proposed edits, all 5 spec-mandated fields populated).
+
+| Field | Value |
+|---|---|
+| Orchestrator script | `scripts/run_hermes_proposal.py` (host-side, Python stdlib only, ~580 LOC; mirrors W3.18 `run_prediction_cycle.py` shape — host owns SQL/persistence/file-I/O, Hermes does LLM-shaped reasoning) |
+| LOQ install path | `/opt/ark-trade-agent/scripts/run_hermes_proposal.py` (currently scp'd from Mac dev session — untracked in LOQ project repo until Mac↔LOQ git sync is repaired) |
+| Invocation pattern | `python3 /opt/ark-trade-agent/scripts/run_hermes_proposal.py [--window-hours N] [--proposal-date YYYY-MM-DD] [--dry-run]`. Defaults: window 24h, proposal_date today UTC, full run (no dry). All paths overridable via env vars (`ARK_EVAL_LEDGER_PATH`, `ARK_HERMES_PROPOSALS_DIR`, `ARK_HERMES_BIN`) or CLI flags. |
+| Vault-write target (v0) | **`/opt/ark-data/hermes-proposals/YYYY-MM-DD.md`** (LOQ-local) — option (b) chosen at W4.20 kickoff over spec-literal `vault/Proposals/YYYY-MM-DD.md`. **Reason**: LOQ does not currently have `vault/` (project repo on LOQ is at W1-era commit; W2/W3 work has been scp-deployed not git-synced). Mac↔LOQ sync repair is orthogonal admin work. User manually promotes accepted proposals from `/opt/ark-data/hermes-proposals/` to `vault/Proposals/` on Mac when reviewing — closer alignment with the educational "user actively pulls + reviews" framing. Spec-literal path becomes the *promotion target*, not the *emission target*. |
+| Sample-size gate handling (v0) | **(i) Telemetry proposal** — proposal lands every day even when below the gate (currently 0/30 fully-scored decision-outcome pairs). Frontmatter `sample_size_gate_cleared: false` + Status section flagged as "telemetry proposal" make it explicit that the writeup documents Day-N ledger state and Hermes' reasoning, NOT a prompt-quality recommendation. Honors success-criterion "first daily proposal lands today" without violating spec's "no prompt-quality claims until N≥30". |
+| Shadow decision shape (v0) | **(A) Counterfactual reasoning** — single `hermes -z` call, prompt includes the baseline rationale + order_intent_json excerpt + the 12-role blessed-baseline catalogue + 7-metric vocabulary. Hermes outputs proposed prompt edits AND a shadow decision text that reasons about what the pipeline *would have* produced with those edits. ~$0.05 per call, ~12-30s wall. Faithful shadow-runs (re-invoking the TradingAgents 5-phase pipeline with overlay prompts) deferred until counterfactual proves unreliable against scored outcomes. |
+| Hermes contract (output schema) | Strict JSON between sentinels `__HERMES_PROPOSAL_JSON__` … `__HERMES_PROPOSAL_JSON_END__`. Top-level keys: `proposed_edits` (array) + `shadow_decision` (object). Each `proposed_edits` item carries the **5 spec-mandated fields**: `affected_prompt` (one of 12 BLESSED_ROLES), `current_version`, `intended_behavior_change`, `evidence_ledger_row_ids`, `expected_metric_movement` (dict keyed by 7-metric vocabulary), `rollback_condition`. `shadow_decision` carries `shadow_signal` (5-tier: Buy/Overweight/Hold/Underweight/Sell), `shadow_rationale`, `differs_from_baseline`, `delta_summary`. |
+| Ledger writes per run | One `decisions` row per baseline (decision_kind=`shadow`, parent_decision_id linking to baseline, prompt_version=`hermes-shadow-of-<blessed-version>`, model_version=`moonshotai/Kimi-K2.6-TEE`, market_snapshot_json=NULL, order_intent_json=full Hermes parsed payload, rationale=shadow_rationale text, broker_order_id=NULL). 7 deferred `metric_scores` rows per shadow (score=NULL, notes=`deferred-outcome-window-pending`) — populated later by W4.22+ outcome-scoring pipeline. |
+| Hermes-Shadow Delta | Computed via SQL JOIN on baseline+shadow decisions × metric_scores where both have non-NULL scores. Returns empty in v0 ledger state (no metric scoring yet). The query shape is in the orchestrator (`compute_shadow_delta()`) ready for when outcome-window populates run. |
+| Output artifacts per run | (a) `<date>.md` — human-readable proposal with all 5 fields per edit, sample-size-gate status, Hermes-Shadow Delta table, baselines-reviewed list, shadow_decision details, provenance footer. (b) `raw/<date>.json` — verbatim Hermes prompt + stdout + parsed JSON payload for postmortem. Both files are written atomically per run. |
+| Idempotency | NOT idempotent within a day. Re-running on the same date overwrites the proposal MD AND inserts ADDITIONAL shadow rows with new `shadow_id`s. v0 acceptable — date-stamped shadows accumulate. Add deduplication when daily cron lands. |
+| Parse failure handling | If Hermes returns malformed JSON or missing sentinels, the `parse_status` column carries the diagnostic (`sentinel-not-found`, `json-decode-failed: <msg>`, `json-not-object: <type>`, `timeout`). Proposal MD still writes with a "Hermes parse failed" section + first 500 chars of raw stdout. Shadow row + metric rows are NOT inserted on parse failure. Raw I/O still captured for postmortem. |
+| First smoke (W4.20 closeout) | NVDA baseline `baseline-20260507T173214Z-8c32b193` → shadow `shadow-20260507T195829Z-8eb0f204`. Hermes returned 3 proposed edits in 4834-char stdout (~12s wall). Edits target Fundamentals Analyst (working-capital-to-growth delta sub-section), Bear Researcher (1-5 surprise-potential score), Portfolio Manager (Signal Transition Thresholds — observable triggers between 5-tier signal levels). Each edit includes the n=0 honesty framing (e.g. "= — purely theoretical with n=0 scored pairs"). Proposal MD at `/opt/ark-data/hermes-proposals/2026-05-07.md` (~6KB), raw at `raw/2026-05-07.json` (~17KB). |
+| Discord notify hook (W4.21) | After successful proposal-MD write, the orchestrator shells out to `notify_discord.py` with `python3 <script>` (defensive against +x mode-bit loss across scp/rsync) and posts a 3-line summary to `#general`: title (date + edit count + gate status), `Baselines: <ticker> <signal>` line, SCP pull-command line. Discord env loaded from `/home/ark-dev/.config/ark-trade-agent/discord.env` (mode 0600, same source OpenClaw heartbeat reads via systemd EnvironmentFile drop-in). 172-char message under Discord's 2000-char content cap; orchestrator caller-respects the cap. **Notify is non-fatal**: any subprocess failure (PermissionError, FileNotFoundError, timeout, non-zero rc, malformed env file) logs a diagnostic but does NOT roll back proposal MD or shadow ledger writes — the user can re-post manually with `python3 scripts/notify_discord.py "<msg>"` if Discord is unreachable at run-time. |
+| Discord opt-out | `--no-notify-discord` CLI flag suppresses the post-write notify even when env is present. Useful for backfill runs (`--proposal-date 2026-05-06 --no-notify-discord`) where you don't want to spam `#general` with historical proposals. |
+
+**Re-apply protocol (orchestrator changes need redeployment to LOQ):**
+```bash
+# After editing scripts/run_hermes_proposal.py on Mac:
+python3 -c "import ast; ast.parse(open('scripts/run_hermes_proposal.py').read())"  # syntax check
+scp scripts/run_hermes_proposal.py ark-dev@192.168.68.83:/opt/ark-trade-agent/scripts/
+ssh ark-dev@192.168.68.83 'chmod +x /opt/ark-trade-agent/scripts/run_hermes_proposal.py'
+```
+
+**W4.20+ followups parked:**
+- **W4.21 Discord notify hook**: extend `scripts/notify_discord.py` (or add a sibling) to fire on every proposal write — `inotifywait /opt/ark-data/hermes-proposals` posts one-line summary + LOQ filepath to `#general` on new file.
+- **W4.22 Observation protocol**: daily session-log review with five fields (proposal diff / accepted-rejected rationale / metric impact / rollback check status / Hermes-Shadow Delta). Establishes the educational discipline that's the actual deliverable.
+- **Outcome-window scorer** (cross-cuts W4.20+): ✅ **next_day_direction landed 2026-05-12** — `scripts/score_metrics.py` deployed to LOQ, scored NVDA baseline + 2 shadows in one pass. Remaining 6 metrics queued; see [Outcome Scorer Configuration](#outcome-scorer-configuration) below for the next builds.
+- **Mac↔LOQ sync repair** (orthogonal): push current Mac project commits to GitHub, LOQ `git pull` to refresh, commit the un-tracked scripts (`init_eval_ledger.py`, `notify_discord.py`, `run_prediction_cycle.py`, `run_hermes_proposal.py`, `score_metrics.py`) so the ledger of what's deployed where becomes git-tracked.
+- **Daily cron** (post-W4.22): once observation protocol is stable, wire a 23:00 ET cron (post-RTH) that runs the orchestrator + posts the proposal link to Discord. Cron via OpenClaw is currently parked (W2.12 scope-upgrade debt) — direct systemd-timer is a viable alternative if OpenClaw cron stays parked through /cso pass.
+- **Idempotency / deduplication**: when daily cron lands, switch to "skip if proposal MD for today already exists" OR "append shadows but rewrite MD"; document the choice when implementing.
+
+## Outcome Scorer Configuration
+
+LOQ install, Week 4 step 22+ followup (surfaced by `vault/Session-Logs/2026-05-07-hermes-review.md`). Per spec § Hermes Evaluation Metrics & Shadow Mode: per-metric scorer that populates `metric_scores.score` as outcome windows close. Without this, Hermes-Shadow Delta stays empty and the spec § Success Criteria deliverable ("user can answer *what is the Hermes-Shadow Delta?*") cannot be met. First metric `next_day_direction` landed 2026-05-12 — NVDA baseline + 2 shadows scored in one pass; first non-empty delta SQL returns 2 (baseline, shadow) pairs both at 0.0 (NVDA rallied +1.77% T+0→T+1; baseline Underweight + shadow Hold + shadow Sell all called wrong direction).
+
+| Field | Value |
+|---|---|
+| Orchestrator script | `scripts/score_metrics.py` (host-side, Python stdlib only, ~290 LOC; mirrors W3.18 / W4.20 shape — host owns SQL + outcome data fetch, moomoo skill provides klines) |
+| LOQ install path | `/opt/ark-trade-agent/scripts/score_metrics.py` (scp'd from Mac dev session — untracked in LOQ project repo until Mac↔LOQ git sync is repaired) |
+| Invocation pattern | `python3 /opt/ark-trade-agent/scripts/score_metrics.py [--metric METRIC] [--decision-id ID] [--ledger-path PATH] [--kline-script PATH] [--uv-bin PATH] [--flat-threshold FLOAT] [--dry-run]`. Default metric is `next_day_direction`; only metric implemented in v0. Paths overridable via env (`ARK_EVAL_LEDGER_PATH`) or CLI flags. |
+| Kline data source | Shells out to moomoo `get_kline.py` via `uv run python <script> US.<TICKER> --ktype 1d --start YYYY-MM-DD --end YYYY-MM-DD --json`. Requires OpenD running on LOQ (W1 step 5 verification artifact). Daily kline historical quota: 1 request per stock per 30 days (re-fetching same ticker doesn't burn a quota slot). |
+| Path discipline | `--uv-bin` defaults to `/home/ark-dev/.local/bin/uv` (absolute path mandatory — `ssh user@host 'cmd'` skips `~/.bashrc` so PATH won't include `~/.local/bin`; same idiom as HEARTBEAT.md). `--kline-script` defaults to `/opt/ark-trade-agent/.claude/skills/moomooapi/scripts/quote/get_kline.py`. |
+| Ticker normalization | Ledger stores bare tickers (e.g. `NVDA`); moomoo skill needs `US.NVDA`. Scorer mirrors `run_prediction_cycle.py:195` idiom: prefix `US.` if ticker doesn't already start with `US.` / `HK.` / `CN.`. |
+| Stdout parsing | The moomoo SDK emits OpenQuoteContext connect/disconnect log lines on **stdout** (not stderr) interleaved with the script's `print(json.dumps(...))` payload. Scorer extracts the single line that starts with `{` — `get_kline.py` emits its JSON in one `print()` call so there's only ever one such line. `2>/dev/null` (the HEARTBEAT.md trick) does NOT work here because the noise is on stdout. |
+| Idempotency | UPDATE WHERE score IS NULL — already-scored rows are skipped on re-run. UNIQUE (decision_id, metric_name) constraint at the SQL layer prevents duplicates. Re-running is safe; `--dry-run` finds 0 targets after a successful scoring pass. |
+| Scoring rule (`next_day_direction`) | Signal → predicted direction: `{Buy, Overweight}` → up (+1), `{Sell, Underweight}` → down (-1), `{Hold}` → flat (0). Fetch kline rows for `[trade_date, trade_date+10 days]` to buffer weekends/holidays. T+0 = first row at-or-after trade_date; T+1 = the immediately following row. Realized direction: up if rel_move > flat_threshold (default 0.005 / 0.5%), down if < -threshold, else flat. Score = 1.0 if predicted == realized, else 0.0. `score_label` carries human-readable `{pred}_predicted_{realized}_realized`. `outcome_window_end_timestamp` = `{T+1_date}T21:00:00+00:00` (RTH close in UTC; intraday session times not available from daily kline). |
+| Signal extraction | Baseline rows: `order_intent_json["signal"]` (per `run_prediction_cycle.py`). Shadow rows: nested under `order_intent_json["shadow_decision"]["shadow_signal"]` (per `run_hermes_proposal.py:382` — full Hermes parsed payload dumped as-is). Unrecognized signals return `None` and the row is left deferred with `notes=signal-unrecognized`. |
+| Metric dispatch | `METRIC_DISPATCH` dict maps each of the 7 metric names to a scorer function. Six unimplemented metrics raise `NotImplementedError` when invoked — script reports `NOT IMPLEMENTED` line per row, ledger untouched, no false-success risk. Adding a metric = one new function + one dispatch entry. |
+| First smoke (2026-05-12) | 3 unscored rows for NVDA (1 baseline + 2 shadows) all scored 0.0 in one pass. T+0 close `$207.83`, T+1 close `$211.50`, rel_move +1.77%. Baseline (Underweight) + shadow #1 (Hold) + shadow #2 (Sell) all wrong direction. Hermes-Shadow Delta SQL now returns 2 rows; both deltas = 0.0. |
+
+**Re-apply protocol (scorer changes need redeployment to LOQ):**
+```bash
+# After editing scripts/score_metrics.py on Mac:
+python3 -c "import ast; ast.parse(open('scripts/score_metrics.py').read())"  # syntax check
+scp scripts/score_metrics.py ark-dev@192.168.68.83:/opt/ark-trade-agent/scripts/
+ssh ark-dev@192.168.68.83 'cd /opt/ark-trade-agent && python3 scripts/score_metrics.py --dry-run'  # smoke
+```
+
+**Pending scorer work (one metric per build, smallest-window-first):**
+- **T+0 metrics — no market data needed, build next**: `risk_rule_compliance` (stop placement, position sizing, ATR-bound check from `order_intent_json`), `rationale_trade_match` (does the trade direction match the rationale text? — string analysis only). These bring 3 of 7 metrics live with no T+5 wait.
+- **T+5 metrics — need realized closes through ~2026-05-13 for the 2026-05-06 trade**: `thesis_accuracy`, `volatility_adjusted_move` (realized vol over the window), `max_adverse_excursion` (intraday lows or close-only — define).
+- **T+5 to T+10 metric**: `catalyst_correctness` — needs LLM judgment ("did the catalyst Hermes / TradingAgents predicted actually play out in the news flow?"). Heavier; likely shells out to Hermes itself or a Chutes call.
+
 ## Patched vendor scripts
 
 These vendor-installed skill scripts have been lifted from sister project moomoo-stock with local modifications — re-apply if a skill is reinstalled (the install copies from `opend-skills.zip` and will overwrite):
