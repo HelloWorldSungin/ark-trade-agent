@@ -60,7 +60,7 @@ DISCORD_CONTENT_CAP = 2000  # Discord hard limit; notify_discord.py's caller-res
 HERMES_RELEASE = "v0.12.0 (2026.4.30)"
 HERMES_MODEL = "moonshotai/Kimi-K2.6-TEE"
 SAMPLE_SIZE_GATE = 30
-HERMES_TIMEOUT_S = 240
+HERMES_TIMEOUT_S = 480  # bumped 240→480 (2026-05-20): Kimi K2.6-TEE timed out 2/5 baselines per pass at 240s
 
 SENTINEL_BEGIN = "__HERMES_PROPOSAL_JSON__"
 SENTINEL_END = "__HERMES_PROPOSAL_JSON_END__"
