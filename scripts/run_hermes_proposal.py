@@ -60,7 +60,7 @@ DISCORD_CONTENT_CAP = 2000  # Discord hard limit; notify_discord.py's caller-res
 HERMES_RELEASE = "v0.12.0 (2026.4.30)"
 HERMES_MODEL = "moonshotai/Kimi-K2.6-TEE"
 SAMPLE_SIZE_GATE = 30
-HERMES_TIMEOUT_S = 480  # bumped 240→480 (2026-05-20): Kimi K2.6-TEE timed out 2/5 baselines per pass at 240s
+HERMES_TIMEOUT_S = int(os.environ.get("ARK_HERMES_TIMEOUT_S", "480"))  # 240→480 bump 2026-05-20: Kimi K2.6-TEE timed out 2/5 baselines per pass at 240s
 
 SENTINEL_BEGIN = "__HERMES_PROPOSAL_JSON__"
 SENTINEL_END = "__HERMES_PROPOSAL_JSON_END__"
@@ -129,7 +129,8 @@ def compose_discord_message(
     baselines (ticker + signal extracted from rationale), SCP pull command.
     Caller-respects Discord's 2000-char content cap."""
     successful = [e for e in entries if e["parsed"]]
-    parse_failures = sum(1 for e in entries if not e["parsed"])
+    timeouts = sum(1 for e in entries if e["parse_status"] == "timeout")
+    parse_failures = sum(1 for e in entries if not e["parsed"] and e["parse_status"] != "timeout")
     edit_count = sum(
         len(e["parsed"].get("proposed_edits", []) or []) for e in successful
     )
@@ -155,6 +156,8 @@ def compose_discord_message(
         )
 
     title_bits = [f"📝 **Hermes Proposal {proposal_date}**", f"{edit_count} edit(s)", gate_status]
+    if timeouts:
+        title_bits.append(f"⚠ {timeouts} timeout")
     if parse_failures:
         title_bits.append(f"⚠ {parse_failures} parse fail")
     line_title = " — ".join(title_bits)

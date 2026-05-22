@@ -5,15 +5,19 @@ Plus apply-gate doctrinal hard floor (the v0 Shadow Mode invariant) and trust-bo
 sanitization (cso-Finding 3 mitigation).
 """
 import json
+import subprocess
 
 import pytest
 
 from run_hermes_proposal import (
+    HERMES_TIMEOUT_S,
     SCHEMA_VERSION,
     SENTINEL_BEGIN,
     SENTINEL_END,
     _sanitize_untrusted_excerpt,
     can_apply_proposal_safely,
+    compose_discord_message,
+    invoke_hermes,
     parse_hermes_response,
 )
 
@@ -146,3 +150,90 @@ def test_schema_version_matches_init_eval_ledger():
     assert SCHEMA_VERSION == INIT_VERSION, (
         f"SCHEMA_VERSION drift: hermes={SCHEMA_VERSION!r} vs init={INIT_VERSION!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Timeout-path coverage — main()'s except handler + Discord title disambiguation
+# (test-coverage gap surfaced by /ark-code-review --thorough on 7d3c219;
+# the constant bump 240→480 is motivated by timeouts, so the path must be tested)
+# ---------------------------------------------------------------------------
+
+
+def _entry(ticker: str, parse_status: str, parsed: dict | None = None) -> dict:
+    return {
+        "baseline": {"ticker": ticker, "rationale": "**Rating**: Hold steady"},
+        "parse_status": parse_status,
+        "parsed": parsed,
+    }
+
+
+def test_invoke_hermes_propagates_timeout_expired(monkeypatch):
+    """invoke_hermes must NOT swallow TimeoutExpired — the main loop's except
+    branch depends on it propagating, with timeout=HERMES_TIMEOUT_S so the
+    log/stderr formatting can quote the configured value."""
+    def fake_run(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=args[0], timeout=kwargs["timeout"])
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    with pytest.raises(subprocess.TimeoutExpired) as excinfo:
+        invoke_hermes("/fake/hermes", "prompt")
+    assert excinfo.value.timeout == HERMES_TIMEOUT_S
+
+
+def test_compose_discord_message_distinguishes_timeout_from_parse_failure(tmp_path):
+    """Silent-failure-hunter HIGH: a pass with N timeouts must not collapse into
+    the same '⚠ N parse fail' badge as a pass with N malformed-JSON responses.
+    At 480s timeout, partial-timeout passes are common; operators triage from
+    the Discord title without opening the MD."""
+    entries = [
+        _entry("AMD", "timeout"),
+        _entry("TSLA", "timeout"),
+        _entry("SOFI", "sentinel-not-found"),
+        _entry("AMZN", "ok", parsed={
+            "proposed_edits": [],
+            "shadow_decision": {"shadow_signal": "Hold", "shadow_rationale": "steady"},
+        }),
+    ]
+    msg = compose_discord_message(
+        entries=entries,
+        ledger_state={"sample_size_gate_cleared": False, "scored_outcome_pairs": 5},
+        proposal_path=tmp_path / "2026-05-22.md",
+        proposal_date="2026-05-22",
+    )
+    title = msg.splitlines()[0]
+    assert "⚠ 2 timeout" in title, f"timeout count missing from title: {title!r}"
+    assert "⚠ 1 parse fail" in title, f"parse-fail count missing from title: {title!r}"
+    # Regression guard: pre-fix would have rendered "⚠ 3 parse fail" (lumped).
+    assert "⚠ 3 parse fail" not in title
+
+
+def test_compose_discord_message_clean_pass_has_no_warning_badges(tmp_path):
+    """All-success pass: no timeout badge, no parse-fail badge."""
+    entries = [
+        _entry("AMZN", "ok", parsed={
+            "proposed_edits": [],
+            "shadow_decision": {"shadow_signal": "Hold", "shadow_rationale": "x"},
+        }),
+    ]
+    msg = compose_discord_message(
+        entries=entries,
+        ledger_state={"sample_size_gate_cleared": False, "scored_outcome_pairs": 5},
+        proposal_path=tmp_path / "2026-05-22.md",
+        proposal_date="2026-05-22",
+    )
+    title = msg.splitlines()[0]
+    assert "timeout" not in title
+    assert "parse fail" not in title
+
+
+def test_hermes_timeout_s_env_override(monkeypatch):
+    """ARK_HERMES_TIMEOUT_S env var overrides the 480s default at import time;
+    pins parity with sibling env-overridable defaults (DEFAULT_LEDGER etc.)."""
+    monkeypatch.setenv("ARK_HERMES_TIMEOUT_S", "120")
+    import importlib
+
+    import run_hermes_proposal as rhp
+    reloaded = importlib.reload(rhp)
+    assert reloaded.HERMES_TIMEOUT_S == 120
+    # Restore default for downstream tests in the same session.
+    monkeypatch.delenv("ARK_HERMES_TIMEOUT_S", raising=False)
+    importlib.reload(rhp)
