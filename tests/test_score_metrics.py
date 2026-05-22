@@ -22,6 +22,7 @@ from score_metrics import (
     _extract_price_near_keyword,
     _extract_quantity,
     extract_signal,
+    score_max_adverse_excursion,
     score_risk_rule_compliance,
     score_volatility_adjusted_move,
 )
@@ -471,3 +472,173 @@ def test_volatility_adjusted_hold_in_and_out_of_band(monkeypatch, closes, expect
     )
     assert result.score == expected_score, f"got {result.score}; notes={result.notes}"
     assert f"flat_predicted_{realized_label}_realized_" in result.score_label
+
+
+# ---------------------------------------------------------------------------
+# Test #5 — score_max_adverse_excursion (T+5 vol-normalized adverse drawdown)
+# ---------------------------------------------------------------------------
+
+
+def _mae_kline_rows(
+    closes: list[float],
+    highs: list[float] | None = None,
+    lows: list[float] | None = None,
+    start_date: str = "2026-05-06",
+) -> list[dict]:
+    """Build T+0..T+(len-1) kline rows with close + high + low.
+    Defaults: high=close*1.005, low=close*0.995 (50bp band around close for
+    benign cases — pass explicit highs/lows to inject adverse excursions)."""
+    base = datetime.strptime(start_date, "%Y-%m-%d").date()
+    h_series = highs if highs is not None else [c * 1.005 for c in closes]
+    lo_series = lows if lows is not None else [c * 0.995 for c in closes]
+    return [
+        {
+            "date": (base + timedelta(days=i)).isoformat(),
+            "close": c,
+            "high": hi,
+            "low": lo,
+        }
+        for i, (c, hi, lo) in enumerate(zip(closes, h_series, lo_series))
+    ]
+
+
+def test_mae_defers_when_window_not_closed(monkeypatch):
+    """T+5 in the future → defer with notes containing 'window-not-closed'."""
+    klines = _mae_kline_rows([100.0, 101.0, 102.0, 103.0, 104.0, 105.0])
+    monkeypatch.setattr("score_metrics.fetch_daily_klines", lambda *a, **k: klines)
+    result = score_max_adverse_excursion(
+        _vol_decision(signal="Buy"),
+        kline_script="x", uv_bin="x",
+        mae_threshold=1.0,
+        today=datetime(2026, 5, 10, 22, 0, tzinfo=timezone.utc),
+    )
+    assert result.score is None
+    assert "window-not-closed" in result.notes
+
+
+def test_mae_defers_on_degenerate_vol(monkeypatch):
+    """All-equal closes → realized_vol=0 → defer with notes='degenerate-vol'."""
+    klines = _mae_kline_rows([100.0] * 6)
+    monkeypatch.setattr("score_metrics.fetch_daily_klines", lambda *a, **k: klines)
+    result = score_max_adverse_excursion(
+        _vol_decision(signal="Buy"),
+        kline_script="x", uv_bin="x",
+        mae_threshold=1.0,
+        today=datetime(2026, 5, 13, 22, 0, tzinfo=timezone.utc),
+    )
+    assert result.score is None
+    assert "degenerate-vol" in result.notes
+
+
+def test_mae_hold_short_circuits_to_one(monkeypatch):
+    """Hold → no position → score=1.0 with label='no-position-hold'. Even
+    crazy prices don't matter because the short-circuit fires BEFORE the
+    kline fetch. Diverges from vol_adj_move (MAE is risk magnitude, not
+    directional match)."""
+    # No fetch_daily_klines monkeypatch — should not be reached.
+    monkeypatch.setattr(
+        "score_metrics.fetch_daily_klines",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("fetch should not run on Hold")),
+    )
+    result = score_max_adverse_excursion(
+        _vol_decision(signal="Hold"),
+        kline_script="x", uv_bin="x",
+        mae_threshold=1.0,
+        today=datetime(2026, 5, 13, 22, 0, tzinfo=timezone.utc),
+    )
+    assert result.score == 1.0
+    assert result.score_label == "no-position-hold"
+    assert "no position taken" in result.notes
+
+
+def test_mae_long_low_drawdown_scores_one(monkeypatch):
+    """Long position on a clean uptrend: all T+1..T+5 lows >= t0_close →
+    mae=0 by max(0, ...) clamp → score=1.0."""
+    closes = [100.0, 101.0, 102.0, 103.0, 104.0, 105.0]
+    # All lows above 100 (the t0_close) → no adverse drawdown for a long.
+    lows = [100.5, 100.5, 101.5, 102.5, 103.5, 104.5]
+    highs = [c * 1.01 for c in closes]
+    klines = _mae_kline_rows(closes, highs=highs, lows=lows)
+    monkeypatch.setattr("score_metrics.fetch_daily_klines", lambda *a, **k: klines)
+    result = score_max_adverse_excursion(
+        _vol_decision(signal="Buy"),
+        kline_script="x", uv_bin="x",
+        mae_threshold=1.0,
+        today=datetime(2026, 5, 13, 22, 0, tzinfo=timezone.utc),
+    )
+    assert result.score == 1.0, f"got {result.score}; notes={result.notes}"
+    assert result.score_label.startswith("long_position_mae=")
+    assert "z=+0.00" in result.score_label
+
+
+def test_mae_long_high_drawdown_scores_zero(monkeypatch):
+    """Long position with a 10% intraday drawdown at T+3 → mae=10% over
+    realized_vol ~1% → z ~10 → score=0.0."""
+    closes = [100.0, 101.0, 100.0, 99.0, 100.0, 100.5]
+    lows = [c * 0.998 for c in closes]
+    lows[3] = 90.0  # 10% adverse intraday low on T+3
+    highs = [c * 1.005 for c in closes]
+    klines = _mae_kline_rows(closes, highs=highs, lows=lows)
+    monkeypatch.setattr("score_metrics.fetch_daily_klines", lambda *a, **k: klines)
+    result = score_max_adverse_excursion(
+        _vol_decision(signal="Buy"),
+        kline_script="x", uv_bin="x",
+        mae_threshold=1.0,
+        today=datetime(2026, 5, 13, 22, 0, tzinfo=timezone.utc),
+    )
+    assert result.score == 0.0, f"got {result.score}; notes={result.notes}"
+    assert result.score_label.startswith("long_position_mae=")
+
+
+def test_mae_short_low_underwater_scores_one(monkeypatch):
+    """Short on a downtrending stock: no T+1..T+5 high exceeds t0_close →
+    mae=0 by clamp → score=1.0."""
+    closes = [100.0, 99.0, 98.0, 97.0, 96.0, 95.0]
+    highs = [99.5, 99.5, 98.5, 97.5, 96.5, 95.5]  # all below 100
+    lows = [c * 0.995 for c in closes]
+    klines = _mae_kline_rows(closes, highs=highs, lows=lows)
+    monkeypatch.setattr("score_metrics.fetch_daily_klines", lambda *a, **k: klines)
+    result = score_max_adverse_excursion(
+        _vol_decision(signal="Underweight"),
+        kline_script="x", uv_bin="x",
+        mae_threshold=1.0,
+        today=datetime(2026, 5, 13, 22, 0, tzinfo=timezone.utc),
+    )
+    assert result.score == 1.0, f"got {result.score}; notes={result.notes}"
+    assert result.score_label.startswith("short_position_mae=")
+
+
+def test_mae_short_high_underwater_scores_zero(monkeypatch):
+    """Short position where stock rallied 10% intraday at T+3 → mae>>1σ → 0.0."""
+    closes = [100.0, 99.0, 100.0, 101.0, 100.0, 99.5]
+    highs = [c * 1.005 for c in closes]
+    highs[3] = 110.0  # 10% adverse rally intraday on T+3
+    lows = [c * 0.995 for c in closes]
+    klines = _mae_kline_rows(closes, highs=highs, lows=lows)
+    monkeypatch.setattr("score_metrics.fetch_daily_klines", lambda *a, **k: klines)
+    result = score_max_adverse_excursion(
+        _vol_decision(signal="Sell"),
+        kline_script="x", uv_bin="x",
+        mae_threshold=1.0,
+        today=datetime(2026, 5, 13, 22, 0, tzinfo=timezone.utc),
+    )
+    assert result.score == 0.0, f"got {result.score}; notes={result.notes}"
+    assert result.score_label.startswith("short_position_mae=")
+
+
+def test_mae_signal_unrecognized_returns_none(monkeypatch):
+    """Garbage signal → defer with notes='signal-unrecognized'. Mirrors the
+    deferred re-pass pattern of the other scorers."""
+    # No fetch needed — should short-circuit before the kline fetch.
+    monkeypatch.setattr(
+        "score_metrics.fetch_daily_klines",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("fetch should not run")),
+    )
+    result = score_max_adverse_excursion(
+        _vol_decision(signal="Maybe"),
+        kline_script="x", uv_bin="x",
+        mae_threshold=1.0,
+        today=datetime(2026, 5, 13, 22, 0, tzinfo=timezone.utc),
+    )
+    assert result.score is None
+    assert "signal-unrecognized" in result.notes
